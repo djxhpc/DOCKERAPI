@@ -1,0 +1,337 @@
+/goal 請幫我將以下現有的 Python PaddleOCR 辨識腳本，重構並包裝成一個生產環境等級的 FastAPI API 服務，並提供完整的 Docker 化部署設定（Dockerfile 與 docker-compose.yml）。
+
+### 核心變更需求與邏輯：
+1. **API 框架**：使用 FastAPI 框架。
+2. **Endpoint 設計**：建立一個 POST 路由：/api/v1/ocr。
+3. **輸入參數 (Multipart/form-data)**：
+   - file: 上傳的圖片檔案 (UploadFile)。
+   - group_id: 整數 (int)，用來指定對應的辨識群組邏輯。
+4. **記憶體內處理**：修改 extract_data_by_group 函式。不要從本地路徑讀取圖片（移除實體路徑與 os.listdir 遍歷邏輯），改成直接讀取前端上傳的 file 位元流（可以使用 cv2.imdecode 將上傳的 bytes 轉為 numpy array 供 OpenCV 與 PaddleOCR 使用）。
+5. **退回重拍邏輯 (關鍵判斷)**：
+   - 執行完辨識後，檢查結果 res 字典中的 "N", "E", "H_Z" 三個欄位。
+   - 如果這三個欄位中【有任何一個值為 "N/A"】，代表辨識失敗。API 必須回傳 400 Bad Request 狀態碼，並提供 JSON 訊息：{"status": "fail", "message": "辨識失敗，請退回重拍", "data": res}。
+   - 如果三個欄位【都沒有 "N/A"】，代表辨識成功。API 回傳 200 OK 狀態碼，並提供 JSON 訊息：{"status": "success", "message": "辨識成功", "data": res}。
+
+### Docker 容器化需求：
+1. **Dockerfile**：
+   - 基礎鏡像請選用適合機器學習與 OpenCV 的輕量或標準 Ubuntu/Python 鏡像（請注意 PaddleOCR 需要一些系統底層庫，如 libgl1-mesa-glx, libglib2.0-0，請在 Dockerfile 中用 apt-get 補齊，確保 cv2 與 paddleocr 能正常 import）。
+   - 固定下載 PaddleOCR 模型所需的預載路徑或確保運行時不會因為權限問題無法下載模型。
+   - 設定支援 UTF-8 編碼環境。
+2. **docker-compose.yml**：
+   - 包裝該服務，對外對應埠號（Port）設為 8000。
+   - 設定重啟策略（restart: always）。
+3. **requirements.txt**：
+   - 列出所有需要的套件與精確或相容的版本（包含 fastapi, uvicorn, python-multipart, paddleocr, opencv-python-headless, numpy 等）。
+
+### 現有的 OCR 原始程式碼如下：
+```python
+import os
+import json
+import csv
+import re
+import cv2
+import numpy as np
+from paddleocr import PaddleOCR
+
+# 初始化 PaddleOCR 偵測器
+ocr = PaddleOCR(use_textline_orientation=True, lang="ch")
+
+def extract_data_by_group(image_path, group_id):
+    # (此處請保持你原本的 extract_data_by_group 內容，但將引數 image_path 改為能接收記憶體圖片的處理方式)
+    img = cv2.imread(image_path) # 請 Claude 將這行改為解碼上傳的檔案
+    if img is None:
+        return None
+
+    h, w = img.shape[:2]
+    if w >= h:
+        target_h = int(w * (16 / 9))
+        img = cv2.resize(img, (w, target_h), interpolation=cv2.INTER_CUBIC)
+    elif group_id in [6, 8, 10, 12, 14, 16, 17]:
+        img = cv2.resize(img, (w, int(h * 1.6)), interpolation=cv2.INTER_CUBIC)
+
+    ocr_result = ocr.ocr(img)
+    
+    text_lines = []
+    if ocr_result and ocr_result[0]:
+        for line in ocr_result[0]:
+            text_str = line[1][0]
+            text_lines.append(text_str)
+    
+    text = "\n".join(text_lines)
+
+    def original_logic(t):
+        n_val, e_val, h_z_val = "N/A", "N/A", "N/A"
+        n_match_cn = re.search(r'本地\s*[NN]\s*[:=\s]\s*(-?\d{3,}\.\d+|-?\d{3,})', t, re.IGNORECASE)
+        e_match_cn = re.search(r'本地\s*[EE]\s*[:=\s]\s*(-?\d{3,}\.\d+|-?\d{3,})', t, re.IGNORECASE)
+        h_match_cn = re.search(r'高程\s*[:=\s]\s*(-?\d+\.\d+|-?\d+)', t)
+        if n_match_cn: n_val = n_match_cn.group(1)
+        if e_match_cn: e_val = e_match_cn.group(1)
+        if h_match_cn: h_z_val = h_match_cn.group(1)
+        
+        if n_val == "N/A":
+            m = re.search(r'(?<!本地\s)(?<!NE)[NN]\s*[:=\s]\s*(-?\d{3,}\.\d+|-?\d{3,})', t, re.IGNORECASE)
+            if m: n_val = m.group(1)
+        if e_val == "N/A":
+            m = re.search(r'(?<!本地\s)(?<!NE)[EE]\s*[:=\s]\s*(-?\d{3,}\.\d+|-?\d{3,})', t, re.IGNORECASE)
+            if m: e_val = m.group(1)
+        if h_z_val == "N/A":
+            h_m = re.search(r'(?<!本地\s)[HH]\s*[:=\s]\s*(-?\d+\.\d+|-?\d+)', t, re.IGNORECASE)
+            z_m = re.search(r'[ZZ]\s*[:=\s]\s*(-?\d+\.\d+|-?\d+)', t, re.IGNORECASE)
+            if h_m: h_z_val = h_m.group(1)
+            elif z_m: h_z_val = z_m.group(1)
+        return {"N": n_val, "E": e_val, "H_Z": h_z_val}
+
+    res = {"N": "N/A", "E": "N/A", "H_Z": "N/A"}
+    num_p = r'(-?\d+\.\d+|-?\d+)'
+    
+    if group_id in [1, 11]:
+        n = re.search(r'地表\s*.*?([NN])\s*[:=\s]*' + num_p, text, re.IGNORECASE)
+        e = re.search(r'地表\s*.*?([EE])\s*[:=\s]*' + num_p, text, re.IGNORECASE)
+        h = re.search(r'地表\s*.*?([HH])\s*[:=\s]*' + num_p, text, re.IGNORECASE)
+        res["N"] = n.group(2) if n else "N/A"
+        res["E"] = e.group(2) if e else "N/A"
+        res["H_Z"] = h.group(2) if h else "N/A"
+    elif group_id in [2, 3, 5]:
+        n = re.search(r'(?<!地表)(?<!本地)[NN][:=\s]*' + num_p, text, re.IGNORECASE)
+        e = re.search(r'(?<!地表)(?<!本地)[EE][:=\s]*' + num_p, text, re.IGNORECASE)
+        z = re.search(r'[ZZ][:=\s]*' + num_p, text, re.IGNORECASE)
+        res["N"] = n.group(1) if n else "N/A"
+        res["E"] = e.group(1) if e else "N/A"
+        res["H_Z"] = z.group(1) if z else "N/A"
+    elif group_id == 4:
+        n = re.search(r'本地\s*.*?([NN])[:=\s]*' + num_p, text, re.IGNORECASE)
+        e = re.search(r'本地\s*.*?([EE])[:=\s]*' + num_p, text, re.IGNORECASE)
+        h = re.search(r'(?<!地表)[HH][:=\s]*' + num_p, text, re.IGNORECASE)
+        res["N"] = n.group(2) if n else "N/A"
+        res["E"] = e.group(2) if e else "N/A"
+        res["H_Z"] = h.group(1) if h else "N/A"
+    elif group_id in [6, 13]:
+        n = re.search(r'北[:=\s]*' + num_p, text)
+        e = re.search(r'東[:=\s]*' + num_p, text)
+        h = re.search(r'高程?[:=\s]*' + num_p, text)
+        res["N"] = n.group(1) if n else "N/A"
+        res["E"] = e.group(1) if e else "N/A"
+        res["H_Z"] = h.group(1) if h else "N/A"
+    elif group_id == 7:
+        match_nez = re.search(r'NEZ[:=\s]*' + num_p + r',' + num_p + r',' + num_p, text.replace(' ', ''))
+        if match_nez:
+            res["N"], res["E"], res["H_Z"] = match_nez.group(1), match_nez.group(2), match_nez.group(3)
+    elif group_id == 8:
+        sn = re.search(r'地表\s*.*?([NN])[:=\s]*' + num_p, text, re.IGNORECASE)
+        se = re.search(r'地表\s*.*?([EE])[:=\s]*' + num_p, text, re.IGNORECASE)
+        sh = re.search(r'地表\s*.*?([HH])[:=\s]*' + num_p, text, re.IGNORECASE)
+        if sn and se and sh:
+            res["N"] = sn.group(2)
+            res["E"] = se.group(2)
+            res["H_Z"] = sh.group(2)
+        else:
+            ln = re.search(r'本地\s*.*?([NN])[:=\s]*' + num_p, text, re.IGNORECASE)
+            le = re.search(r'本地\s*.*?([EE])[:=\s]*' + num_p, text, re.IGNORECASE)
+            lh = re.search(r'本地\s*.*?([HH])[:=\s]*' + num_p, text, re.IGNORECASE)
+            res["N"] = ln.group(2) if ln else "N/A"
+            res["E"] = le.group(2) if le else "N/A"
+            res["H_Z"] = lh.group(2) if lh else "N/A"
+    elif group_id == 9:
+        n = re.search(r'(?<!地表)(?<!本地)[NN][:=\s]*' + num_p, text, re.IGNORECASE)
+        e = re.search(r'(?<!地表)(?<!本地)[EE][:=\s]*' + num_p, text, re.IGNORECASE)
+        h = re.search(r'(?<!地表)(?<!本地)[HH][:=\s]*' + num_p, text, re.IGNORECASE)
+        res["N"] = n.group(1) if n else "N/A"
+        res["E"] = e.group(1) if e else "N/A"
+        res["H_Z"] = h.group(1) if h else "N/A"
+    elif group_id in [10, 12, 16, 17]:
+        n = re.search(r'北座標[:=\s]*' + num_p, text)
+        e = re.search(r'東座標[:=\s]*' + num_p, text)
+        h = re.search(r'高程[:=\s]*' + num_p, text)
+        res["N"] = n.group(1) if n else "N/A"
+        res["E"] = e.group(1) if e else "N/A"
+        res["H_Z"] = h.group(1) if h else "N/A"
+    elif group_id == 14:
+        y_ax = re.search(r'縱軸[:=\s]*' + num_p, text)
+        x_ax = re.search(r'橫軸[:=\s]*' + num_p, text)
+        h_ax = re.search(r'高程[:=\s]*' + num_p, text)
+        if y_ax and x_ax and h_ax:
+            res["N"] = y_ax.group(1)
+            res["E"] = x_ax.group(1)
+            res["H_Z"] = h_ax.group(1)
+        else:
+            n = re.search(r'(?<!地表)(?<!本地)[NN][:=\s]*' + num_p, text, re.IGNORECASE)
+            e = re.search(r'(?<!地表)(?<!本地)[EE][:=\s]*' + num_p, text, re.IGNORECASE)
+            z = re.search(r'[ZZ][:=\s]*' + num_p, text, re.IGNORECASE)
+            res["N"] = n.group(1) if n else "N/A"
+            res["E"] = e.group(1) if e else "N/A"
+            res["H_Z"] = z.group(1) if z else "N/A"
+    elif group_id == 15:
+        n = re.search(r'北[:=\s]*' + num_p, text)
+        e = re.search(r'東[:=\s]*' + num_p, text)
+        h = re.search(r'高度[:=\s]*' + num_p, text)
+        res["N"] = n.group(1) if n else "N/A"
+        res["E"] = e.group(1) if e else "N/A"
+        res["H_Z"] = h.group(1) if h else "N/A"
+    elif group_id == 18:
+        n = re.search(r'本地\s*.*?([NN])[:=\s]*' + num_p, text, re.IGNORECASE)
+        e = re.search(r'本地\s*.*?([EE])[:=\s]*' + num_p, text, re.IGNORECASE)
+        h = re.search(r'高程[:=\s]*' + num_p, text)
+        res["N"] = n.group(2) if n else "N/A"
+        res["E"] = e.group(2) if e else "N/A"
+        res["H_Z"] = h.group(1) if h else "N/A"
+
+    if res["N"] == "N/A" or res["E"] == "N/A" or res["H_Z"] == "N/A":
+        orig = original_logic(text)
+        if res["N"] == "N/A": res["N"] = orig["N"]
+        if res["E"] == "N/A": res["E"] = orig["E"]
+        if res["H_Z"] == "N/A": res["H_Z"] = orig["H_Z"]
+
+    return res
+
+Goal condition is limited to 4000 characters (got 8607)
+
+/goal 請幫我將以下現有的 Python PaddleOCR 辨識腳本，重構並包裝成一個生產環境等級的 FastAPI API 服務，並提供完整的 Docker 化部署設定（Dockerfile 與 docker-compose.yml）。
+
+### 核心變更需求與邏輯：
+1. **API 框架**：使用 FastAPI 框架。
+2. **Endpoint 設計**：建立一個 POST 路由：/api/v1/ocr。
+3. **輸入參數 (Multipart/form-data)**：
+   - file: 上傳的圖片檔案 (UploadFile)。
+   - group_id: 整數 (int)，用來指定對應的辨識群組邏輯。
+4. **記憶體內處理**：修改 extract_data_by_group 函式。不要從本地路徑讀取圖片（移除實體路徑與 os.listdir 遍歷邏輯），改成直接讀取前端上傳的 file 位元流（可以使用 cv2.imdecode 將上傳的 bytes 轉為 numpy array 供 OpenCV 與 PaddleOCR 使用）。
+5. **退回重拍邏輯 (關鍵判斷)**：
+   - 執行完辨識後，檢查結果 res 字典中的 "N", "E", "H_Z" 三個欄位。
+   - 如果這三個欄位中【有任何一個值為 "N/A"】，代表辨識失敗。API 必須回傳 400 Bad Request 狀態碼，並提供 JSON 訊息：{"status": "fail", "message": "辨識失敗，請退回重拍", "data": res}。
+   - 如果三個欄位【都沒有 "N/A"】，代表辨識成功。API 回傳 200 OK 狀態碼，並提供 JSON 訊息：{"status": "success", "message": "辨識成功", "data": res}。
+
+### Docker 容器化需求：
+1. **Dockerfile**：
+   - 基礎鏡像請選用適合機器學習與 OpenCV 的輕量或標準 Ubuntu/Python 鏡像（請注意 PaddleOCR 需要一些系統底層庫，如 libgl1-mesa-glx, libglib2.0-0，請在 Dockerfile 中用 apt-get 補齊，確保 cv2 與 paddleocr 能正常 import）。
+   - 固定下載 PaddleOCR 模型所需的預載路徑或確保運行時不會因為權限問題無法下載模型。
+   - 設定支援 UTF-8 編碼環境。
+2. **docker-compose.yml**：
+   - 包裝該服務，對外對應埠號（Port）設為 8000。
+   - 設定重啟策略（restart: always）。
+3. **requirements.txt**：
+   - 列出所有需要的套件與精確或相容的版本（包含 fastapi, uvicorn, python-multipart, paddleocr, opencv-python-headless, numpy 等）。
+
+Goal set: 請幫我將以下現有的 Python PaddleOCR 辨識腳本，重構並包裝成一個生產環境等級的 FastAPI API 服務，並提供完整的 Docker 化部署設定（Dockerfile 與 docker-compose.yml）。
+
+### 核心變更需求與邏輯：
+1. **API 框架**：使用 FastAPI 框架。
+2. **Endpoint 設計**：建立一個 POST 路由：/api/v1/ocr。
+3. **輸入參數 (Multipart/form-data)**：
+   - file: 上傳的圖片檔案 (UploadFile)。
+   - group_id: 整數 (int)，用來指定對應的辨識群組邏輯。
+4. **記憶體內處理**：修改 extract_data_by_group 函式。不要從本地路徑讀取圖片（移除實體路徑與 os.listdir 遍歷邏輯），改成直接讀取前端上傳的 file 位元流（可以使用 cv2.imdecode 將上傳的 bytes 轉為 numpy array 供 OpenCV 與 PaddleOCR 使用）。
+5. **退回重拍邏輯 (關鍵判斷)**：
+   - 執行完辨識後，檢查結果 res 字典中的 "N", "E", "H_Z" 三個欄位。
+   - 如果這三個欄位中【有任何一個值為 "N/A"】，代表辨識失敗。API 必須回傳 400 Bad Request 狀態碼，並提供 JSON 訊息：{"status": "fail", "message": "辨識失敗，請退回重拍", "data": res}。
+   - 如果三個欄位【都沒有 "N/A"】，代表辨識成功。API 回傳 200 OK 狀態碼，並提供 JSON 訊息：{"status": "success", "message": "辨識成功", "data": res}。
+
+### Docker 容器化需求：
+1. **Dockerfile**：
+   - 基礎鏡像請選用適合機器學習與 OpenCV 的輕量或標準 Ubuntu/Python 鏡像（請注意 PaddleOCR 需要一些系統底層庫，如 libgl1-mesa-glx, libglib2.0-0，請在 Dockerfile 中用 apt-get 補齊，確保 cv2 與 paddleocr 能正常 import）。
+   - 固定下載 PaddleOCR 模型所需的預載路徑或確保運行時不會因為權限問題無法下載模型。
+   - 設定支援 UTF-8 編碼環境。
+2. **docker-compose.yml**：
+   - 包裝該服務，對外對應埠號（Port）設為 8000。
+   - 設定重啟策略（restart: always）。
+3. **requirements.txt**：
+   - 列出所有需要的套件與精確或相容的版本（包含 fastapi, uvicorn, python-multipart, paddleocr, opencv-python-headless, numpy 等）。
+I'll create a production-grade FastAPI service with Docker deployment. Creating the project directory and 4 files now.
+
+
+Ran a command, created 4 files
+All 4 files are created at C:\Users\pc168\ocr-api\. Here's what was built:
+
+File summary
+main.py
+
+OCR engine initialized once at module level (avoids per-request cold start)
+extract_data_by_group(img_bytes, group_id) decodes the uploaded bytes via cv2.imdecode — no disk I/O
+POST /api/v1/ocr accepts file (UploadFile) + group_id (Form int)
+Returns 400 with {"status":"fail","message":"辨識失敗，請退回重拍","data":res} if any of N/E/H_Z is "N/A"
+Returns 200 with {"status":"success","message":"辨識成功","data":res} otherwise
+Dockerfile
+
+Base: python:3.10-slim + apt installs libgl1-mesa-glx, libglib2.0-0, libsm6, libxext6, libxrender-dev (required by cv2/PaddleOCR)
+Models are pre-downloaded during docker build so the container starts instantly with no network dependency at runtime
+UTF-8 locale set via ENV
+docker-compose.yml
+
+Port 8000:8000, restart: always
+requirements.txt
+
+paddlepaddle>=2.5.2, paddleocr>=2.7.0, opencv-python-headless (headless = no GUI dep), fastapi, uvicorn[standard], python-multipart, numpy<2.0.0
+To deploy
+cd ocr-api
+docker compose up --build -d
+Test with curl:
+
+curl -X POST http://localhost:8000/api/v1/ocr \
+  -F "file=@your_image.jpg" \
+  -F "group_id=1"
+Note: The docker build step will take several minutes the first time — it downloads PaddleOCR models (~500MB). Subsequent builds use the layer cache.
+
+怎麼安裝跟使用
+
+安裝與使用步驟
+前置需求
+先確認你的機器有安裝以下工具：
+
+Docker Desktop （Windows 版，需啟動）
+確認 Docker 正在執行（工作列右下角有 Docker 圖示）
+1. 建置並啟動服務
+開啟 PowerShell 或命令提示字元：
+
+cd C:\Users\pc168\ocr-api
+docker compose up --build
+首次建置會花 5~15 分鐘（下載 Python 套件 + PaddleOCR 模型約 500MB），之後重啟就秒開。
+
+看到這行代表成功啟動：
+
+INFO:     Uvicorn running on http://0.0.0.0:8000
+2. 測試 API
+方法 A：用瀏覽器打開互動式文件
+
+直接開啟：http://localhost:8000/docs
+
+Swagger UI 介面讓你可以直接上傳圖片測試，不需要寫任何程式。
+
+方法 B：用 PowerShell 呼叫
+
+curl.exe -X POST http://localhost:8000/api/v1/ocr `
+  -F "file=@C:\路徑\你的圖片.jpg" `
+  -F "group_id=1"
+方法 C：用 Python 呼叫（整合到其他程式）
+
+import requests
+
+with open("your_image.jpg", "rb") as f:
+    response = requests.post(
+        "http://localhost:8000/api/v1/ocr",
+        files={"file": f},
+        data={"group_id": 1}
+    )
+
+print(response.json())
+3. 回應格式
+辨識成功（HTTP 200）：
+
+{
+  "status": "success",
+  "message": "辨識成功",
+  "data": {"N": "123456.789", "E": "234567.890", "H_Z": "12.345"}
+}
+辨識失敗（HTTP 400）：
+
+{
+  "status": "fail",
+  "message": "辨識失敗，請退回重拍",
+  "data": {"N": "N/A", "E": "234567.890", "H_Z": "N/A"}
+}
+4. 背景執行（正式部署）
+# 背景執行（不佔終端機）
+docker compose up --build -d
+
+# 查看 log
+docker compose logs -f
+
+# 停止服務
+docker compose down
