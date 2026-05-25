@@ -1,0 +1,276 @@
+import os
+import json
+import csv
+import re
+import cv2
+import pytesseract
+from PIL import Image
+
+# ==========================================
+# 1. 基本設定
+# ==========================================
+# Windows 使用者請確認此路徑正確
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+# 根目錄路徑 (請依據你的實際狀況調整)
+BASE_FOLDER = r"D:\work\OCR\cluster" 
+OUTPUT_JSON = "coordinates_output_all052101.json"
+
+# ==========================================
+# 2. 核心 OCR 辨識函式
+# ==========================================
+def extract_data_by_group(image_path, group_id):
+    """
+    根據不同的 group_id 進行專屬的預處理與 Regex 匹配。
+    group_id 可以是 1~18，或者是 'single'。
+    """
+    img = cv2.imread(image_path)
+    if img is None:
+        return None
+
+    # -------------------------------------------------------------
+    # A. 影像預處理 (精準還原被壓扁的圖片、逼出灰字)
+    # -------------------------------------------------------------
+    h, w = img.shape[:2]
+    
+    # 【核心修正】針對像 241 那種極端被壓扁的圖片進行動態拉伸還原
+    # 正常的手機截圖是直的 (w < h)，如果 w >= h 代表被強行壓扁了，必須拉回直式 (16:9) 比例
+    if w >= h:
+        target_h = int(w * (16 / 9))
+        img = cv2.resize(img, (w, target_h), interpolation=cv2.INTER_CUBIC)
+    elif group_id in [6, 8, 10, 12, 14, 16, 17]:
+        # 其他已知文字容易變扁的群組，強制將高度拉伸 1.6 倍
+        img = cv2.resize(img, (w, int(h * 1.6)), interpolation=cv2.INTER_CUBIC)
+
+    # 轉灰階並放大圖片 (放大 2 倍能讓被還原的文字邊緣更平滑)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.bilateralFilter(gray, d=11, sigmaColor=85, sigmaSpace=85)
+    
+    # 使用適當的區塊大小與常數，強行將淡灰色字體逼成清晰的黑字
+    thresh = cv2.adaptiveThreshold(gray, 255, 
+                                  cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                  cv2.THRESH_BINARY, 51, 15)
+
+    # 執行 OCR (支援繁中+英文數字)
+    custom_config = r'--psm 6'
+    text = pytesseract.image_to_string(thresh, config=custom_config, lang='chi_tra+eng')
+
+    # -------------------------------------------------------------
+    # B. 原本的識別邏輯 (保留不變，作為通用/備用補救機制)
+    # -------------------------------------------------------------
+    def original_logic(t):
+        n_val, e_val, h_z_val = "N/A", "N/A", "N/A"
+        n_match_cn = re.search(r'本地\s*[NN]\s*[:=\s]\s*(-?\d{3,}\.\d+|-?\d{3,})', t, re.IGNORECASE)
+        e_match_cn = re.search(r'本地\s*[EE]\s*[:=\s]\s*(-?\d{3,}\.\d+|-?\d{3,})', t, re.IGNORECASE)
+        h_match_cn = re.search(r'高程\s*[:=\s]\s*(-?\d+\.\d+|-?\d+)', t)
+        if n_match_cn: n_val = n_match_cn.group(1)
+        if e_match_cn: e_val = e_match_cn.group(1)
+        if h_match_cn: h_z_val = h_match_cn.group(1)
+        
+        if n_val == "N/A":
+            m = re.search(r'(?<!本地\s)(?<!NE)[NN]\s*[:=\s]\s*(-?\d{3,}\.\d+|-?\d{3,})', t, re.IGNORECASE)
+            if m: n_val = m.group(1)
+        if e_val == "N/A":
+            m = re.search(r'(?<!本地\s)(?<!NE)[EE]\s*[:=\s]\s*(-?\d{3,}\.\d+|-?\d{3,})', t, re.IGNORECASE)
+            if m: e_val = m.group(1)
+        if h_z_val == "N/A":
+            h_m = re.search(r'(?<!本地\s)[HH]\s*[:=\s]\s*(-?\d+\.\d+|-?\d+)', t, re.IGNORECASE)
+            z_m = re.search(r'[ZZ]\s*[:=\s]\s*(-?\d+\.\d+|-?\d+)', t, re.IGNORECASE)
+            if h_m: h_z_val = h_m.group(1)
+            elif z_m: h_z_val = z_m.group(1)
+        return {"N": n_val, "E": e_val, "H_Z": h_z_val}
+
+    # -------------------------------------------------------------
+    # C. 各群組專屬 Regex 匹配邏輯 (保留小數點、優化模糊匹配)
+    # -------------------------------------------------------------
+    res = {"N": "N/A", "E": "N/A", "H_Z": "N/A"}
+    num_p = r'(-?\d+\.\d+|-?\d+)'  # 優先抓取小數點，無小數點則抓整數
+    
+    if group_id in [1, 11]:  # 地表N 地表E 地表H
+        n = re.search(r'地表\s*.*?([NN])\s*[:=\s]*' + num_p, text, re.IGNORECASE)
+        e = re.search(r'地表\s*.*?([EE])\s*[:=\s]*' + num_p, text, re.IGNORECASE)
+        h = re.search(r'地表\s*.*?([HH])\s*[:=\s]*' + num_p, text, re.IGNORECASE)
+        res["N"] = n.group(2) if n else "N/A"
+        res["E"] = e.group(2) if e else "N/A"
+        res["H_Z"] = h.group(2) if h else "N/A"
+
+    elif group_id in [2, 3, 5]:  # N E Z
+        n = re.search(r'(?<!地表)(?<!本地)[NN][:=\s]*' + num_p, text, re.IGNORECASE)
+        e = re.search(r'(?<!地表)(?<!本地)[EE][:=\s]*' + num_p, text, re.IGNORECASE)
+        z = re.search(r'[ZZ][:=\s]*' + num_p, text, re.IGNORECASE)
+        res["N"] = n.group(1) if n else "N/A"
+        res["E"] = e.group(1) if e else "N/A"
+        res["H_Z"] = z.group(1) if z else "N/A"
+
+    elif group_id == 4:  # 本地N 本地E H
+        n = re.search(r'本地\s*.*?([NN])[:=\s]*' + num_p, text, re.IGNORECASE)
+        e = re.search(r'本地\s*.*?([EE])[:=\s]*' + num_p, text, re.IGNORECASE)
+        h = re.search(r'(?<!地表)[HH][:=\s]*' + num_p, text, re.IGNORECASE)
+        res["N"] = n.group(2) if n else "N/A"
+        res["E"] = e.group(2) if e else "N/A"
+        res["H_Z"] = h.group(1) if h else "N/A"
+
+    elif group_id in [6, 13]:  # 北 東 高程 / 北 東 高
+        n = re.search(r'北[:=\s]*' + num_p, text)
+        e = re.search(r'東[:=\s]*' + num_p, text)
+        h = re.search(r'高程?[:=\s]*' + num_p, text)
+        res["N"] = n.group(1) if n else "N/A"
+        res["E"] = e.group(1) if e else "N/A"
+        res["H_Z"] = h.group(1) if h else "N/A"
+
+    elif group_id == 7:  # NEZ(有,做區隔)
+        match_nez = re.search(r'NEZ[:=\s]*' + num_p + r',' + num_p + r',' + num_p, text.replace(' ', ''))
+        if match_nez:
+            res["N"], res["E"], res["H_Z"] = match_nez.group(1), match_nez.group(2), match_nez.group(3)
+
+    elif group_id == 8:  # 地表N E H【或】本地N E H
+        # 先嘗試抓取 地表
+        sn = re.search(r'地表\s*.*?([NN])[:=\s]*' + num_p, text, re.IGNORECASE)
+        se = re.search(r'地表\s*.*?([EE])[:=\s]*' + num_p, text, re.IGNORECASE)
+        sh = re.search(r'地表\s*.*?([HH])[:=\s]*' + num_p, text, re.IGNORECASE)
+        
+        if sn and se and sh:
+            res["N"] = sn.group(2)
+            res["E"] = se.group(2)
+            res["H_Z"] = sh.group(2)
+        else:
+            # 如果地表沒抓齊，退回嘗試抓取 本地
+            ln = re.search(r'本地\s*.*?([NN])[:=\s]*' + num_p, text, re.IGNORECASE)
+            le = re.search(r'本地\s*.*?([EE])[:=\s]*' + num_p, text, re.IGNORECASE)
+            lh = re.search(r'本地\s*.*?([HH])[:=\s]*' + num_p, text, re.IGNORECASE)
+            res["N"] = ln.group(2) if ln else "N/A"
+            res["E"] = le.group(2) if le else "N/A"
+            res["H_Z"] = lh.group(2) if lh else "N/A"
+
+    elif group_id == 9:  # N E H
+        n = re.search(r'(?<!地表)(?<!本地)[NN][:=\s]*' + num_p, text, re.IGNORECASE)
+        e = re.search(r'(?<!地表)(?<!本地)[EE][:=\s]*' + num_p, text, re.IGNORECASE)
+        h = re.search(r'(?<!地表)(?<!本地)[HH][:=\s]*' + num_p, text, re.IGNORECASE)
+        res["N"] = n.group(1) if n else "N/A"
+        res["E"] = e.group(1) if e else "N/A"
+        res["H_Z"] = h.group(1) if h else "N/A"
+
+    elif group_id in [10, 12, 16, 17]:  # 北座標 東座標 高程
+        n = re.search(r'北座標[:=\s]*' + num_p, text)
+        e = re.search(r'東座標[:=\s]*' + num_p, text)
+        h = re.search(r'高程[:=\s]*' + num_p, text)
+        res["N"] = n.group(1) if n else "N/A"
+        res["E"] = e.group(1) if e else "N/A"
+        res["H_Z"] = h.group(1) if h else "N/A"
+
+    elif group_id == 14:  # 縱軸 橫軸 高程【或】N E Z
+        # 先嘗試抓取 縱軸 橫軸 高程
+        y_ax = re.search(r'縱軸[:=\s]*' + num_p, text)
+        x_ax = re.search(r'橫軸[:=\s]*' + num_p, text)
+        h_ax = re.search(r'高程[:=\s]*' + num_p, text)
+        
+        if y_ax and x_ax and h_ax:
+            res["N"] = y_ax.group(1)
+            res["E"] = x_ax.group(1)
+            res["H_Z"] = h_ax.group(1)
+        else:
+            # 如果沒有，退回嘗試抓取 N E Z
+            n = re.search(r'(?<!地表)(?<!本地)[NN][:=\s]*' + num_p, text, re.IGNORECASE)
+            e = re.search(r'(?<!地表)(?<!本地)[EE][:=\s]*' + num_p, text, re.IGNORECASE)
+            z = re.search(r'[ZZ][:=\s]*' + num_p, text, re.IGNORECASE)
+            res["N"] = n.group(1) if n else "N/A"
+            res["E"] = e.group(1) if e else "N/A"
+            res["H_Z"] = z.group(1) if z else "N/A"
+
+    elif group_id == 15:  # 北 東 高度
+        n = re.search(r'北[:=\s]*' + num_p, text)
+        e = re.search(r'東[:=\s]*' + num_p, text)
+        h = re.search(r'高度[:=\s]*' + num_p, text)
+        res["N"] = n.group(1) if n else "N/A"
+        res["E"] = e.group(1) if e else "N/A"
+        res["H_Z"] = h.group(1) if h else "N/A"
+
+    elif group_id == 18:  # 本地N 本地E 高程
+        n = re.search(r'本地\s*.*?([NN])[:=\s]*' + num_p, text, re.IGNORECASE)
+        e = re.search(r'本地\s*.*?([EE])[:=\s]*' + num_p, text, re.IGNORECASE)
+        h = re.search(r'高程[:=\s]*' + num_p, text)
+        res["N"] = n.group(2) if n else "N/A"
+        res["E"] = e.group(2) if e else "N/A"
+        res["H_Z"] = h.group(1) if h else "N/A"
+
+    # -------------------------------------------------------------
+    # D. 補救機制 (若上述特定群組規則沒抓齊全，用原本的舊邏輯進行補償)
+    # -------------------------------------------------------------
+    if res["N"] == "N/A" or res["E"] == "N/A" or res["H_Z"] == "N/A":
+        orig = original_logic(text)
+        if res["N"] == "N/A": res["N"] = orig["N"]
+        if res["E"] == "N/A": res["E"] = orig["E"]
+        if res["H_Z"] == "N/A": res["H_Z"] = orig["H_Z"]
+
+    return res
+
+# ==========================================
+# 3. 主程式：遍歷所有群組與 single_photos
+# ==========================================
+def main():
+    final_output_data = {}
+    valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff')
+
+    # 處理 group_1 到 group_18
+    for g_num in range(1, 19):
+        folder_name = f"group_{g_num}"
+        folder_path = os.path.join(BASE_FOLDER, folder_name)
+        
+        if not os.path.exists(folder_path):
+            print(f"提示：找不到資料夾 '{folder_path}'，跳過。")
+            continue
+            
+        print(f"\n--- 開始處理群組: {folder_name} ---")
+        final_output_data[folder_name] = {}
+        
+        files = [f for f in os.listdir(folder_path) if f.lower().endswith(valid_extensions)]
+        for file_name in files:
+            full_path = os.path.join(folder_path, file_name)
+            try:
+                result = extract_data_by_group(full_path, group_id=g_num)
+                final_output_data[folder_name][file_name] = result
+                print(f"[{folder_name}] {file_name} -> 識別結果: {result}")
+            except Exception as e:
+                final_output_data[folder_name][file_name] = {"N": "N/A", "E": "N/A", "H_Z": "N/A"}
+                print(f"[{folder_name}] 錯誤: {file_name} -> {e}")
+
+    # 處理 single_photos (利用1~18的所有邏輯進行判斷辨識)
+    single_folder_path = os.path.join(BASE_FOLDER, "single_photos")
+    if os.path.exists(single_folder_path):
+        print(f"\n--- 開始處理群組: single_photos ---")
+        final_output_data["single_photos"] = {}
+        
+        files = [f for f in os.listdir(single_folder_path) if f.lower().endswith(valid_extensions)]
+        for file_name in files:
+            full_path = os.path.join(single_folder_path, file_name)
+            
+            best_result = {"N": "N/A", "E": "N/A", "H_Z": "N/A"}
+            # 輪流用 1 到 18 的群組規則做測試，只要完全沒有 "N/A" 的話就是最佳解
+            for try_g_id in range(1, 19):
+                try:
+                    result = extract_data_by_group(full_path, group_id=try_g_id)
+                    if result and "N/A" not in result.values():
+                        best_result = result
+                        break
+                    # 若只有部分欄位抓到，先留做備用
+                    if result and any(v != "N/A" for v in result.values()):
+                        best_result = result
+                except:
+                    continue
+            
+            final_output_data["single_photos"][file_name] = best_result
+            print(f"[single_photos] {file_name} -> 最佳識別結果: {best_result}")
+    else:
+        print(f"\n提示：找不到資料夾 'single_photos'。")
+
+    # -------------------------------------------------------------
+    # E. 儲存為 JSON 檔案
+    # -------------------------------------------------------------
+    with open(OUTPUT_JSON, "w", encoding="utf-8") as json_file:
+        json.dump(final_output_data, json_file, ensure_ascii=False, indent=4)
+        
+    print(f"\n全數處理完成！結果已儲存至 JSON 檔案: {OUTPUT_JSON}")
+
+if __name__ == "__main__":
+    main()
