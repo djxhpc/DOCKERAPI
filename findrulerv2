@@ -1,0 +1,193 @@
+import json
+import os
+import numpy as np
+from PIL import Image
+from ultralytics import YOLO
+
+def check_bbox_intersection(box_v, box_h):
+    """
+    超寬鬆幾何判定：只要橫框的 Y 座標在直框的 Y 軸範圍內，
+    且橫框的 X 範圍有交集或非常靠近，就判定為交叉。
+    """
+    vx1, vy1, vx2, vy2 = box_v
+    hx1, hy1, hx2, hy2 = box_h
+    
+    # 1. 先用原本的嚴格重疊判定
+    ix1 = max(vx1, hx1)
+    iy1 = max(vy1, hy1)
+    ix2 = min(vx2, hx2)
+    iy2 = min(vy2, hy2)
+    if ix2 > ix1 and iy2 > iy1:
+        return True
+        
+    # 2. 🟢 寬鬆防呆：計算中心點與區間
+    v_center_x = (vx1 + vx2) / 2
+    h_center_y = (hy1 + hy2) / 2
+    
+    # 只要橫物的中心 Y 座標，落在直尺的上下 Y 範圍之內
+    # 且直尺的中心 X 座標，落在橫物的左右 X 範圍之內
+    if (vy1 <= h_center_y <= vy2) and (hx1 <= v_center_x <= hx2):
+        return True
+        
+    # 3. 🟢 極度寬鬆防呆：允許 50 像素的膨脹邊緣（擴大直尺的範圍）
+    if (vy1 - 50 <= h_center_y <= vy2 + 50) and (hx1 - 50 <= v_center_x <= hx2 + 50):
+        return True
+        
+    return False
+
+def run_ordered_yolo_pipeline(json_path, folder_path, model_path):
+    """
+    讀取原始 JSON 列表，依檔名排序後使用 YOLO 辨識，並輸出詳細分類的 JSON 報告
+    """
+    if not os.path.exists(json_path):
+        print(f"❌ 找不到 JSON 檔案：{json_path}")
+        return
+        
+    # 1. 載入自訂 YOLO 模型
+    print(f"🤖 正在載入您的自訂 YOLO 模型：{model_path} ...")
+    model = YOLO(model_path)
+    
+    # 2. 讀取輸入的 JSON 清單
+    print(f"📂 正在載入原始 JSON 檔案...")
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    
+    # 🟢 關鍵優化：篩選出有效資料，並依據檔名 (filename) 進行 A-Z 排序
+    valid_items = [item for item in data if item.get("images")]
+    valid_items.sort(key=lambda x: x["images"])
+    
+    total_records = len(valid_items)
+    print(f"📊 成功載入並排序！共 {total_records} 筆影像紀錄。開始執行 YOLO 推理...\n" + "-"*60)
+
+    # 初始化新 JSON 的儲存結構
+    output_result_data = {
+        "summary": {
+            "total_images": total_records,
+            "both_detected_crossed": 0,
+            "both_detected_not_crossed": 0,
+            "vertical_only": 0,
+            "horizontal_only": 0,
+            "none_detected": 0,
+            "file_read_errors": 0
+        },
+        "results_list": [] # 依序存放每張圖的詳細辨識結果
+    }
+
+    # 3. 依序遍歷每張相片
+    for idx, item in enumerate(valid_items, 1):
+        filename = item.get("images")
+        img_path = os.path.join(folder_path, filename)
+        
+        # 解決 Windows 中文路徑問題
+        try:
+            if not os.path.exists(img_path):
+                raise FileNotFoundError("Image file does not exist")
+            pil_img = Image.open(img_path).convert("RGB")
+            img_rgb = np.array(pil_img)
+        except Exception as e:
+            output_result_data["results_list"].append({
+                "filename": filename,
+                "absolute_path": os.path.abspath(img_path),
+                "status": "Error",
+                "reason": f"File read error: {str(e)}"
+            })
+            output_result_data["summary"]["file_read_errors"] += 1
+            continue
+
+        # 4. YOLOv8 推理辨識
+        results = model.predict(source=img_rgb, verbose=False)[0]
+        
+        vertical_boxes = []
+        horizontal_boxes = []
+        
+        # 解析標籤 (0: Vertical, 1: Horizontal)
+        for box in results.boxes:
+            cls_id = int(box.cls[0].item())
+            xyxy = box.xyxy[0].tolist() 
+            conf = float(box.conf[0].item())
+            
+            if conf > 0.05: # 置信度門檻設定為 40%
+                if cls_id == 1: 
+                    vertical_boxes.append(xyxy)
+                elif cls_id == 0:
+                    horizontal_boxes.append(xyxy)
+
+        # 5. 詳細分類邏輯 (包含：兩個都抓到、兩個都沒抓到、單邊抓到)
+        v_count = len(vertical_boxes)
+        h_count = len(horizontal_boxes)
+        
+        status = ""
+        reason = ""
+
+        if v_count == 0 and h_count == 0:
+            status = "None Detected"
+            reason = "Both vertical and horizontal rulers are missing"
+            output_result_data["summary"]["none_detected"] += 1
+            
+        elif v_count > 0 and h_count == 0:
+            status = "Vertical Only"
+            reason = "Detected vertical ruler, but missing horizontal structure"
+            output_result_data["summary"]["vertical_only"] += 1
+            
+        elif v_count == 0 and h_count > 0:
+            status = "Horizontal Only"
+            reason = "Detected horizontal structure, but missing vertical ruler"
+            output_result_data["summary"]["horizontal_only"] += 1
+            
+        elif v_count > 0 and h_count > 0:
+            # 兩個都抓到了，進一步驗證是否有「交叉擺放」
+            is_crossed = False
+            for b_v in vertical_boxes:
+                for b_h in horizontal_boxes:
+                    if check_bbox_intersection(b_v, b_h):
+                        is_crossed = True
+                        break
+                if is_crossed:
+                    break
+            
+            if is_crossed:
+                status = "Both Detected (Crossed)"
+                reason = "Perfect setup: Both rulers detected and crossed"
+                output_result_data["summary"]["both_detected_crossed"] += 1
+            else:
+                status = "Both Detected (Not Crossed)"
+                reason = "Both rulers exist in the image, but they do not cross each other"
+                output_result_data["summary"]["both_detected_not_crossed"] += 1
+
+        # 6. 將當前相片結果存入清單
+        output_result_data["results_list"].append({
+            "filename": filename,
+            "absolute_path": os.path.abspath(img_path),
+            "status": status,
+            "reason": reason,
+            "detections": {
+                "vertical_count": v_count,
+                "horizontal_count": h_count
+            }
+        })
+
+        # 每 200 張印一次進度
+        if idx % 200 == 0 or idx == total_records:
+            summary_now = output_result_data["summary"]
+            print(f"⏳ 進度：[{idx}/{total_records}] | 符合交叉: {summary_now['both_detected_crossed']} | 沒交叉: {summary_now['both_detected_not_crossed']} | 沒抓到: {summary_now['none_detected']}")
+
+    # 7. 儲存輸出為新 JSON 檔案
+    output_dir = os.path.dirname(json_path)
+    final_report_path = os.path.join(output_dir, "final_yolo_ordered_results.json")
+    
+    with open(final_report_path, "w", encoding="utf-8") as f:
+        json.dump(output_result_data, f, ensure_ascii=False, indent=4)
+        
+    print("-" * 60)
+    print(f"🎉 依序辨識任務完成！")
+    print(f"💾 排序後的結構化 JSON 報告已儲存至：\n   {final_report_path}")
+
+if __name__ == "__main__":
+    # 配置路徑
+    my_json_path = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\114\管線\測量拍照-管頂埋深照片\114測量拍照-管頂埋深照片_output\output.json"
+    my_photo_folder = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\114\管線\測量拍照-管頂埋深照片"
+    
+    # 請替換成您訓練出來的 best.pt 絕對路徑
+    my_model_weight = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\best.pt"
+    
+    run_ordered_yolo_pipeline(my_json_path, my_photo_folder, my_model_weight)
