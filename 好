@@ -1,0 +1,35 @@
+if class_id == 1:
+    # class 1（本地N/E/H）：H 取最後一個，避免抓到上方的儀器高H
+    mn = None
+    me = None
+    mh_val = None
+    for np_, ep_, hp_ in _CLASS_PATTERNS[1]:
+        if not mn: mn = re.search(np_, text, re.IGNORECASE)
+        if not me: me = re.search(ep_, text, re.IGNORECASE)
+        if not mh_val:
+            mh_all = re.findall(hp_, text, re.IGNORECASE)
+            mh_val = mh_all[-1] if mh_all else None
+
+    if mn and me and mh_val:
+        res = {"N": mn.group(1), "E": me.group(1), "H_Z": mh_val}
+    else:
+        # 未全中 → fallback 到全格式（H 同樣取最後一個）
+        res = {"N": "N/A", "E": "N/A", "H_Z": "N/A"}
+        for np_, ep_, hp_ in _COORD_PATTERNS:
+            if not mn: mn = re.search(np_, text, re.IGNORECASE)
+            if not me: me = re.search(ep_, text, re.IGNORECASE)
+            if not mh_val:
+                mh_all = re.findall(hp_, text, re.IGNORECASE)
+                mh_val = mh_all[-1] if mh_all else None
+        res = {
+            "N":   mn.group(1)  if mn     else "N/A",
+            "E":   me.group(1)  if me     else "N/A",
+            "H_Z": mh_val       if mh_val else "N/A",
+        }
+
+elif class_id in _CLASS_PATTERNS:
+    res = _match_coord(text, _CLASS_PATTERNS[class_id])
+    if any(v == "N/A" for v in [res["N"], res["E"], res["H_Z"]]):
+        res = _match_coord(text, _COORD_PATTERNS)
+else:
+    res = _match_coord(text, _COORD_PATTERNS)
