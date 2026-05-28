@@ -14,6 +14,7 @@ pipeline_0525.py — 影像去重與多模態辨識整合管道
 import os
 import json
 import re
+import unicodedata
 import numpy as np
 from PIL import Image, ImageOps
 import imagehash
@@ -23,22 +24,23 @@ import imagehash
 # =============================================
 # 設定區 — 請依實際情況修改
 # =============================================
-BASE_DIR = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\no_years_驗證測量讀數照片"
+# BASE_DIR = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\no_years_驗證測量讀數照片"
+BASE_DIR = "D:\work2"
 YEARS    = ["測試"]
 
 # ── 全域整合輸出路徑（此處修正：確保變數有被正確宣告） ───────────────────
-GLOBAL_ALL_RESULTS_PATH  = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\all_results.json"
-GLOBAL_REPEAT_IMAGE_PATH = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\repeat_images.json"
+GLOBAL_ALL_RESULTS_PATH  = r"D:\work2\0526ocr\output\all_results.json"
+GLOBAL_REPEAT_IMAGE_PATH = r"D:\work2\0526ocr\output\repeat_images.json"
 
 # ── 工具路徑 ──────────────────────────────────
 YOLO_MODEL_PATH    = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\best.pt"
-RULER_YOLO_ENABLED = True   # False = 只跑 ruler_ac（A+C法），跳過 YOLO 尺規辨識
+RULER_YOLO_ENABLED = False  # False = 只跑 ruler_ac（A+C法），跳過 YOLO 尺規辨識
 TESSERACT_CMD      = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 COORD_OCR_GROUP_ID = None  # 已改用 PaddleOCR，此參數保留相容性，不再生效
 BENCHMARK_GPU      = True
 
 # ── 水準點 YOLO 輔助裁切（訓練完模型後將 BENCHMARK_YOLO_CROP 改為 True）──
-BENCHMARK_YOLO_CROP       = True                       # False = 停用；True = 啟用
+BENCHMARK_YOLO_CROP       = False                       # False = 停用；True = 啟用
 BENCHMARK_YOLO_MODEL_PATH = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\runs\detect\train-7\weights\best.pt" # 訓練好的一等水準點偵測模型
 BENCHMARK_YOLO_CONF       = 0.25   # 偵測信心閾值（低一點避免漏偵測）
 BENCHMARK_YOLO_PADDING    = 0.3    # 裁切框四周額外留邊比例（相對於框的寬/高）
@@ -87,8 +89,8 @@ CLASSIFY_CLASS_STEPS = {
 OCR_LOW_CONF_THRESH = 0.6   # 座標 OCR：低於此比例的欄位為 N/A 時標記為需複核
 
 # ── 座標 OCR YOLO 格式分類（訓練完模型後將 COORD_YOLO_ENABLED 改為 True）──
-COORD_YOLO_ENABLED    = True                         # False = 停用；True = 啟用
-COORD_YOLO_MODEL_PATH = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\no_years_驗證測量讀數照片\classify_output\runs\classify\weights\best.pt"  # 訓練好的座標格式分類模型
+COORD_YOLO_ENABLED    = False                        # False = 停用；True = 啟用
+COORD_YOLO_MODEL_PATH = r"D:\work2\0526ocr\best.pt"  # 訓練好的座標格式分類模型
 COORD_YOLO_CONF       = 0.2  # 低於此信心值 → fallback 到全格式模式（類別 9）
 # 模型輸出類別名稱 → 格式代號（1–8），依訓練時設定的 CLASS_DIRS key 填寫；未列出的 → 9（全模式）
 COORD_YOLO_CLASS_MAP  = {
@@ -613,6 +615,47 @@ def _extract_coord_bottom_left(image_path, engine, crop_ratio=0.45):
     return res
 
 
+def _extract_coord_local_neh(image_path, engine):
+    """
+    Class 1 (local_NEH) 專用。
+    找到「本地E」數值的位置後，只在其後方搜尋 H。
+    狀態列的 H 格式為 "H: 0.013"（冒號分隔），座標 H 為 "H  9.6263"（空格分隔），
+    使用 \\s+ 只匹配空格，排除冒號格式的狀態列 H。
+    """
+    text = _ocr_with_paddle(image_path, engine)
+
+    print(f"\n--- [DEBUG Class 1 OCR 文字] 檔案: {os.path.basename(image_path)} ---")
+    print(text if text else "(完全沒有辨識出任何文字)")
+    print("--------------------------------------------------")
+
+    n_match = re.search(r'本地.*?[NN][:=\s]*' + _NUM, text, re.IGNORECASE)
+    e_match = re.search(r'本地.*?[EE][:=\s]*' + _NUM, text, re.IGNORECASE)
+
+    res = {"N": "N/A", "E": "N/A", "H_Z": "N/A"}
+    if n_match:
+        res["N"] = n_match.group(1)
+    if e_match:
+        res["E"] = e_match.group(1)
+        # 只在本地E數值之後搜尋 H，且只接受空格分隔（\s+）
+        # 排除狀態列 "H: 0.013"（冒號分隔）這類誤判
+        text_after_e = text[e_match.end():]
+        # 第一層：有 H 標籤（空格分隔，排除狀態列的 H: 冒號格式）
+        h_match = re.search(r'[HH]\s+' + _NUM, text_after_e, re.IGNORECASE)
+        if not h_match:
+            # 第二層：H 標籤被 OCR 吃掉，直接取第一個出現在行首的數字
+            h_match = re.search(r'^\s*' + _NUM, text_after_e, re.MULTILINE)
+        if h_match:
+            res["H_Z"] = h_match.group(1)
+
+    # H 仍未找到 → 改找高程
+    if res["H_Z"] == "N/A":
+        h2 = re.search(r'高程[:=\s]*' + _NUM, text, re.IGNORECASE)
+        if h2:
+            res["H_Z"] = h2.group(1)
+
+    return res
+
+
 def run_coord_ocr(output_json_path, folder_path, group_id=None):
     """
     增量座標 OCR（RapidOCR 版）。
@@ -657,7 +700,13 @@ def run_coord_ocr(output_json_path, folder_path, group_id=None):
         try:
             # ── Step A: YOLO 格式分類 ─────────────────────────────
             class_id = 9  # 預設：全格式 fallback
-            if coord_yolo:
+
+            # 優先：從檔名讀取 class id（例如 photo_c1.jpg → class 1）
+            _fn_cls = re.search(r'_c([1-9])(?=[_.])', fn)
+            if _fn_cls:
+                class_id = int(_fn_cls.group(1))
+                print(f"  [座標OCR] 檔名指定類別: class {class_id} ({fn})")
+            elif coord_yolo:
                 try:
                     pred     = coord_yolo(fp)[0]
                     conf     = float(pred.probs.top1conf)
@@ -667,44 +716,142 @@ def run_coord_ocr(output_json_path, folder_path, group_id=None):
                 except Exception:
                     class_id = 9
 
+            # ── 原始版本（未加入檔名判斷）──
+            # class_id = 9
+            # if coord_yolo:
+            #     try:
+            #         pred     = coord_yolo(fp)[0]
+            #         conf     = float(pred.probs.top1conf)
+            #         cls_name = pred.names[pred.probs.top1]
+            #         if conf >= COORD_YOLO_CONF:
+            #             class_id = COORD_YOLO_CLASS_MAP.get(cls_name, 9)
+            #     except Exception:
+            #         class_id = 9
+
             # ── Step B: 依格式提取座標 ────────────────────────────
             # ── Step B: 依格式提取座標（加強類別 2, 8 的純 NEZ 辨識） ────────────────────
             if class_id == 6:
                 res = _extract_coord_bottom_left(fp, engine)
+            elif class_id == 1:
+                res = _extract_coord_local_neh(fp, engine)
+                if any(v == "N/A" for v in [res["N"], res["E"], res["H_Z"]]):
+                    text = _ocr_with_paddle(fp, engine)
+                    res = _match_coord(text, _COORD_PATTERNS)
             else:
                 text = _ocr_with_paddle(fp, engine)
-                
+                # NFKC 正規化：一次將全形字母/數字/符號（Ａ→A、Ｅ→E、１→1、：→:等）轉為標準形式
+                text = unicodedata.normalize('NFKC', text)
+
                 if class_id in [2]:
-                    # 1. 針對類別 2, 8 進行 OCR 文本清洗與容錯處理
-                    # 有時候 Z 會被誤認成 2、7 或小寫 z，且字母後方常有雜訊
-                    cleaned_text = text.replace(" ", "")  # 移除空格方便連續匹配
-                    
-                    # 嘗試匹配常見的 NEZ 緊湊格式，允許 Z 誤判為 2 或 7 (例如：N25.123E121.123Z45.6 或 N25.123E121.123245.6)
-                    # 這裡運用正則表達式：(?::|=)? 後方接數字
+                    print(f"\n--- [DEBUG Class 2 OCR 文字] 檔案: {os.path.basename(fp)} ---")
+                    print(text if text else "(完全沒有辨識出任何文字)")
+                    print("--------------------------------------------------")
+
+                    cleaned_text = text.replace(" ", "")
+
+                    # 第一優先：緊湊格式（N/E/Z 直接相連，無換行）
                     pattern_nez_strict = (
-                        r'[NN](?::|=)?' + _NUM + 
-                        r'[EE](?::|=)?' + _NUM + 
+                        r'[NN](?::|=)?' + _NUM +
+                        r'[EE](?::|=)?' + _NUM +
                         r'[ZZ27z](?::|=)?' + _NUM
                     )
                     m_strict = re.search(pattern_nez_strict, cleaned_text, re.IGNORECASE)
-                    
+
                     if m_strict:
                         res = {"N": m_strict.group(1), "E": m_strict.group(2), "H_Z": m_strict.group(3)}
                     else:
-                        # 如果緊湊匹配失敗，改用標準專用 patterns（允許換行或夾雜字元）
-                        nez_specific_patterns = [
-                            (r'[NN][:=\s]*' + _NUM, r'[EE][:=\s]*' + _NUM, r'[ZZ27z][:=\s]*' + _NUM),
-                        ]
-                        res = _match_coord(text, nez_specific_patterns)
-                        
-                    # 2. 如果依然有欄位是 N/A，立刻 fallback 到全域萬用格式
+                        # 第二優先：標籤與數值分行（N 獨立在行首，避免誤抓 σN/σE/σZ）
+                        # (?:^|\n)\s* 確保 N/E/Z 出現在行首，σN 前有 σ 字元故不符合
+                        n_m = re.search(r'(?:^|\n)\s*[NN]\s*[\n:=]\s*' + _NUM, text, re.IGNORECASE)
+                        e_m = re.search(r'(?:^|\n)\s*[EE]\s*[\n:=]\s*' + _NUM, text, re.IGNORECASE)
+                        z_m = re.search(r'(?:^|\n)\s*[ZZ27z]\s*[\n:=]\s*' + _NUM, text, re.IGNORECASE)
+                        res = {
+                            "N":   n_m.group(1) if n_m else "N/A",
+                            "E":   e_m.group(1) if e_m else "N/A",
+                            "H_Z": z_m.group(1) if z_m else "N/A",
+                        }
+
+                    # 第三優先：N/E/Z 標籤全缺，依整數位數特徵識別
+                    # N ≥ 7 位整數、E = 6 位整數、Z 緊接在 E 之後
+                    if any(v == "N/A" for v in [res["N"], res["E"], res["H_Z"]]):
+                        _standalone_re = re.compile(r'^\s*(-?\d+(?:\.\d+)?)\s*m?\s*$')
+                        nums_in_order = []
+                        for _line in text.split('\n'):
+                            _m = _standalone_re.match(_line)
+                            if _m:
+                                nums_in_order.append(_m.group(1))
+                        coord_n, coord_e, coord_z = None, None, None
+                        for v in nums_in_order:
+                            int_digits = len(v.split('.')[0].lstrip('-'))
+                            if int_digits >= 7 and coord_n is None:
+                                coord_n = v
+                            elif int_digits >= 6 and coord_n is not None and coord_e is None:
+                                coord_e = v
+                            elif coord_e is not None and coord_z is None:
+                                coord_z = v
+                        if coord_n and coord_e and coord_z:
+                            res = {"N": coord_n, "E": coord_e, "H_Z": coord_z}
+
+                    # 最終 fallback：全域萬用格式
                     if any(v == "N/A" for v in [res["N"], res["E"], res["H_Z"]]):
                         res = _match_coord(text, _COORD_PATTERNS)
                         
+                elif class_id == 3:
+                    print(f"\n--- [DEBUG Class 3 OCR 文字] 檔案: {os.path.basename(fp)} ---")
+                    print(text if text else "(完全沒有辨識出任何文字)")
+                    print("--------------------------------------------------")
+
+                    res = _match_coord(text, _CLASS_PATTERNS[3])
+                    if any(v == "N/A" for v in [res["N"], res["E"], res["H_Z"]]):
+                        res = _match_coord(text, _COORD_PATTERNS)
+
+                    # 數字位數 fallback（縱軸/橫軸/高程 標籤被 OCR 遺漏時）
+                    if any(v == "N/A" for v in [res["N"], res["E"], res["H_Z"]]):
+                        _standalone_re = re.compile(r'^\s*(-?\d+(?:\.\d+)?)\s*m?\s*$')
+                        nums_in_order = []
+                        for _line in text.split('\n'):
+                            _m = _standalone_re.match(_line)
+                            if _m:
+                                nums_in_order.append(_m.group(1))
+                        coord_n, coord_e, coord_z = None, None, None
+                        for v in nums_in_order:
+                            int_digits = len(v.split('.')[0].lstrip('-'))
+                            if int_digits >= 7 and coord_n is None:
+                                coord_n = v
+                            elif int_digits >= 6 and coord_n is not None and coord_e is None:
+                                coord_e = v
+                            elif coord_e is not None and coord_z is None:
+                                coord_z = v
+                        if coord_n and coord_e and coord_z:
+                            res = {"N": coord_n, "E": coord_e, "H_Z": coord_z}
+
                 elif class_id in _CLASS_PATTERNS:
+                    if class_id == 4:
+                        print(f"\n--- [DEBUG Class 4 OCR 文字] 檔案: {os.path.basename(fp)} ---")
+                        print(text if text else "(完全沒有辨識出任何文字)")
+                        print("--------------------------------------------------")
                     res = _match_coord(text, _CLASS_PATTERNS[class_id])
                     if any(v == "N/A" for v in [res["N"], res["E"], res["H_Z"]]):
                         res = _match_coord(text, _COORD_PATTERNS)
+                    # 數字位數 fallback（class 4：地表E 標籤被 OCR 漏讀時，依位數識別）
+                    if class_id == 4 and any(v == "N/A" for v in [res["N"], res["E"], res["H_Z"]]):
+                        _standalone_re = re.compile(r'^\s*(-?\d+(?:\.\d+)?)\s*m?\s*$')
+                        nums_in_order = []
+                        for _line in text.split('\n'):
+                            _m = _standalone_re.match(_line)
+                            if _m:
+                                nums_in_order.append(_m.group(1))
+                        coord_n, coord_e, coord_z = None, None, None
+                        for v in nums_in_order:
+                            int_digits = len(v.split('.')[0].lstrip('-'))
+                            if int_digits >= 7 and coord_n is None:
+                                coord_n = v
+                            elif int_digits >= 6 and coord_n is not None and coord_e is None:
+                                coord_e = v
+                            elif coord_e is not None and coord_z is None:
+                                coord_z = v
+                        if coord_n and coord_e and coord_z:
+                            res = {"N": coord_n, "E": coord_e, "H_Z": coord_z}
                 else:
                     res = _match_coord(text, _COORD_PATTERNS)
 
