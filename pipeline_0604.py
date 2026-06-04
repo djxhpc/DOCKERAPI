@@ -24,8 +24,8 @@ import imagehash
 # =============================================
 # 設定區 — 請依實際情況修改
 # =============================================
-BASE_DIR = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi"
-# BASE_DIR = "D:\work2"
+# BASE_DIR = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi"
+BASE_DIR = "D:\work2"
 # ── 解決路徑重複拼接的偽裝物件 ──────────────────────────────────
 class SmartYearPath(str):
     def __new__(cls, year_num, full_sub_path):
@@ -43,20 +43,20 @@ class SmartYearPath(str):
         return self.year_num
 
 # 建立 110 到 115 的基礎年份清單
-_RAW_YEARS = ["110", "111", "112", "113", "114", "115"]
-# _RAW_YEARS = ["117"]
-
+# _RAW_YEARS = ["110", "111", "112", "113", "114", "115"]
+_RAW_YEARS = ["0526ocr"]
+# D:\work2\0526ocr\testorror
 # 自動過濾並建立偽裝路徑物件
 YEARS = []
 for y in _RAW_YEARS:
-    _target_sub = os.path.join(y, r"管線\測量坐標讀數")
+    _target_sub = os.path.join(y, r"testorror")
     if os.path.exists(os.path.join(BASE_DIR, _target_sub)):
         # 封裝：純年份為 y，路徑為 _target_sub
         YEARS.append(SmartYearPath(y, _target_sub))
 
 # ── 全域整合輸出路徑（此處修正：確保變數有被正確宣告） ───────────────────
-GLOBAL_ALL_RESULTS_PATH  = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\110_115管線測量坐標讀數v2all_results.json"
-GLOBAL_REPEAT_IMAGE_PATH = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\110_115管線測量坐標讀數v2repeat_images.json"
+GLOBAL_ALL_RESULTS_PATH  = r"D:\work2\0526ocr\testorror\110_115管線測量坐標讀數v2all_results.json"
+GLOBAL_REPEAT_IMAGE_PATH = r"D:\work2\0526ocr\testorror\110_115管線測量坐標讀數v2repeat_images.json"
 
 # ── 工具路徑 ──────────────────────────────────
 YOLO_MODEL_PATH    = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\best.pt"
@@ -123,7 +123,8 @@ OCR_LOW_CONF_THRESH = 0.6   # 座標 OCR：低於此比例的欄位為 N/A 時�
 
 # ── 座標 OCR YOLO 格式分類（訓練完模型後將 COORD_YOLO_ENABLED 改為 True）──
 COORD_YOLO_ENABLED    = True                        # False = 停用；True = 啟用
-COORD_YOLO_MODEL_PATH = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\no_years_驗證測量讀數照片\classify_output\runs\classify\weights\best.pt"  # 訓練好的座標格式分類模型
+COORD_YOLO_MODEL_PATH = r"D:\work2\0526ocr\best2.pt"
+# COORD_YOLO_MODEL_PATH = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\no_years_驗證測量讀數照片\classify_output\runs\classify\weights\best.pt"  # 訓練好的座標格式分類模型
 COORD_YOLO_CONF       = 0.1  # 低於此信心值 → fallback 到全格式模式（類別 9）
 # 模型輸出類別名稱 → 格式代號（1–8），依訓練時設定的 CLASS_DIRS key 填寫；未列出的 → 9（全模式）
 COORD_YOLO_CLASS_MAP  = {
@@ -527,15 +528,16 @@ _CLASS_PATTERNS = {
         (r'縱軸[:=\s]*' + _NUM, r'橫軸[:=\s]*' + _NUM, r'高程[:=\s]*' + _NUM),
         # (r'縱軸[:=\s]*' + _NUM, r'[橫横][軸由][:=\s]*' + _NUM, r'高程[:=\s]*' + _NUM),
     ],
-    4: [  # 本地N/E 高程 / 地表N/E/H
+    4: [  # 本地N/E 高程 / 地表N/E/H / 坐标北值/东值/H值
         (r'本地.*?[NN][:=\s]*' + _NUM, r'本地.*?[EE][:=\s]*' + _NUM, r'高程[:=\s]*'         + _NUM),
         (r'地表.*?[NN][:=\s]*' + _NUM, r'地表.*?[EE][:=\s]*' + _NUM, r'地表.*?[HH][:=\s]*' + _NUM),
     ],
-    5: [  # 北座標/東座標/高（繁簡）/ 北東高度 / 北東高
+    5: [  # 北座標/東座標/高（繁簡）/ 北東高度 / 北東高 / N E h（小寫h儀器格式）
         (r'北[座坐][標标][:=\s]*' + _NUM, r'[東东][座坐][標标][:=\s]*' + _NUM, r'高[座坐][標标][:=\s]*' + _NUM),
         (r'北[座坐][標标][:=\s]*' + _NUM, r'[東东][座坐][標标][:=\s]*' + _NUM, r'高程[:=\s]*'           + _NUM),
         (r'北[:=\s]*'             + _NUM, r'東[:=\s]*'                 + _NUM, r'高度[:=\s]*'           + _NUM),
         (r'北[:=\s]*'             + _NUM, r'東[:=\s]*'                 + _NUM, r'高[:=\s]*'             + _NUM),
+        (r'[Nn][:=\s]*'           + _NUM, r'[Ee][:=\s]*'              + _NUM, r'[Hh][:=\s]+'           + _NUM),
     ],
     # 7: [  # N E Z / 北 東 高程
     #     (r'[NN][:=\s]*' + _NUM, r'[EE][:=\s]*' + _NUM, r'[ZZ][:=\s]*' + _NUM),
@@ -855,8 +857,13 @@ def run_coord_ocr(output_json_path, folder_path, group_id=None):
                     if any(v == "N/A" for v in [res["N"], res["E"], res["H_Z"]]):
                         res = _match_coord(text, _COORD_PATTERNS)
 
-                    # 第三優先：文字殘缺或順序混亂，改用全域數字位數特徵與關鍵字鄰居識別
-                    if any(v == "N/A" for v in [res["N"], res["E"], res["H_Z"]]):
+                    # 第三優先：文字殘缺、順序混亂，或 E 誤抓點名裡的短數字（如 K3019FE97-R → E=97），改用 TWD97 位數特徵識別
+                    _c3_bad = (
+                        any(v == "N/A" for v in [res["N"], res["E"], res["H_Z"]]) or
+                        (res["N"] != "N/A" and len(res["N"].split('.')[0].lstrip('-')) != 7) or
+                        (res["E"] != "N/A" and len(res["E"].split('.')[0].lstrip('-')) != 6)
+                    )
+                    if _c3_bad:
                         all_nums = re.findall(r'-?\d+(?:\.\d+)?', text)
                         
                         coord_n, coord_e, coord_z = None, None, None
@@ -1021,13 +1028,48 @@ def run_coord_ocr(output_json_path, folder_path, group_id=None):
                         print("  [Class 7 警告] 無法依位數特徵配對出 NE，改採萬用規則。")
                         res = _match_coord(text, _COORD_PATTERNS)     
                 elif class_id in _CLASS_PATTERNS:
-                    if class_id == 4:
-                        print(f"\n--- [DEBUG Class 4 OCR 文字] 檔案: {os.path.basename(fp)} ---")
+                    if class_id in [4, 5]:
+                        print(f"\n--- [DEBUG Class {class_id} OCR 文字] 檔案: {os.path.basename(fp)} ---")
                         print(text if text else "(完全沒有辨識出任何文字)")
                         print("--------------------------------------------------")
                     res = _match_coord(text, _CLASS_PATTERNS[class_id])
                     if any(v == "N/A" for v in [res["N"], res["E"], res["H_Z"]]):
                         res = _match_coord(text, _COORD_PATTERNS)
+                    # 數字位數 fallback（class 5：北/東標籤被 OCR 吃掉或誤抓非座標數字時，依 TWD97 位數特徵識別）
+                    def _int_digits(v): return len(v.split('.')[0].lstrip('-'))
+                    _c5_need_fallback = (
+                        any(v == "N/A" for v in [res["N"], res["E"], res["H_Z"]]) or
+                        (res["N"] != "N/A" and _int_digits(res["N"]) != 7) or
+                        (res["E"] != "N/A" and _int_digits(res["E"]) != 6)
+                    )
+                    if class_id == 5 and _c5_need_fallback:
+                        _all_m = list(re.finditer(r'-?\d+(?:\.\d+)?', text))
+                        _cn, _ce, _ch = None, None, None
+                        _n_idx = _e_idx = -1
+                        for _i, _m in enumerate(_all_m):
+                            _v = _m.group()
+                            _id = len(_v.split('.')[0].lstrip('-'))
+                            if _id == 7 and _cn is None:
+                                _cn = _v; _n_idx = _i
+                                break
+                        if _cn:
+                            for _i, _m in enumerate(_all_m):
+                                if _i <= _n_idx: continue
+                                _v = _m.group()
+                                _id = len(_v.split('.')[0].lstrip('-'))
+                                if _id == 6 and _ce is None:
+                                    _ce = _v; _e_idx = _i
+                                    break
+                        if _ce:
+                            for _i, _m in enumerate(_all_m):
+                                if _i <= _e_idx: continue
+                                _v = _m.group()
+                                _ip = _v.split('.')[0].lstrip('-')
+                                if _ip != '0' and 1 <= len(_ip) <= 3:
+                                    _ch = _v; break
+                        if _cn and _ce and _ch:
+                            res = {"N": _cn, "E": _ce, "H_Z": _ch}
+
                     # 數字位數 fallback（class 4：地表E 標籤被 OCR 漏讀時，依位數識別）
                     if class_id == 4 and any(v == "N/A" for v in [res["N"], res["E"], res["H_Z"]]):
                         _standalone_re = re.compile(r'^\s*(-?\d+(?:\.\d+)?)\s*m?\s*$')
@@ -1039,7 +1081,7 @@ def run_coord_ocr(output_json_path, folder_path, group_id=None):
                         coord_n, coord_e, coord_z = None, None, None
                         for v in nums_in_order:
                             int_digits = len(v.split('.')[0].lstrip('-'))
-                            if int_digits >= 7 and coord_n is None:
+                            if int_digits == 7 and coord_n is None:
                                 coord_n = v
                             elif int_digits >= 6 and coord_n is not None and coord_e is None:
                                 coord_e = v
