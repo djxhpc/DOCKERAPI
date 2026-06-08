@@ -24,9 +24,6 @@ import imagehash
 # =============================================
 # 設定區 — 請依實際情況修改
 # =============================================
-# =============================================
-# 設定區 — 請依實際情況修改
-# =============================================
 BASE_DIR = r"D:\Chiayi_AI"
 # BASE_DIR = r"D:\work2"
 # ── 解決路徑重複拼接的偽裝物件 ──────────────────────────────────
@@ -659,6 +656,7 @@ def _ocr_with_paddle(image_path, engine):
 
 def _match_coord(text, patterns):
     """從 OCR 文字依 patterns 依序提取 N/E/H_Z，回傳最佳結果 dict。"""
+    
     best = {"N": "N/A", "E": "N/A", "H_Z": "N/A"}
     m = re.search(r'NEZ[:=\s]*' + _NUM + r',' + _NUM + r',' + _NUM, text.replace(' ', ''))
     if m:
@@ -717,15 +715,31 @@ def _digit_fallback_twd97(text):
     n_idx = e_idx = -1
 
     # Step 1: 找 N（第一個 7 位整數）
+    # Step 1: 找 N（數值介於 2,000,000 到 3,000,000 之間的 7 位整數）
     for i, m in enumerate(all_m):
-        v = m.group()
-        if len(v.split('.')[0].lstrip('-')) == 7 and cn is None:
-            cn = v; n_idx = i; break
+        v_str = m.group()
+        # 移除潛在的小數點部分，取整數部分進行判斷
+        clean_v = v_str.split('.')[0].lstrip('-')
+        
+        # 檢查是否為 7 位數
+        if len(clean_v) == 7 and cn is None:
+            val = int(clean_v)
+            # 檢查數值範圍
+            if 2000000 <= val <= 3000000:
+                cn = v_str
+                n_idx = i
+                break
 
     if cn:
         # Step 2: 收集 N 之後所有 6 位候選
-        e_candidates = [(i, m.group()) for i, m in enumerate(all_m)
-                        if i > n_idx and len(m.group().split('.')[0].lstrip('-')) == 6]
+        e_candidates = []
+        for i, m in enumerate(all_m):
+            if i > n_idx:
+                val_str = m.group().split('.')[0].lstrip('-')
+                if len(val_str) == 6:
+                    val = int(val_str)
+                    if 100000 <= val <= 400000:
+                        e_candidates.append((i, m.group()))
 
         # 優先：緊接下一個數字是合法 H 的候選
         for e_i, e_v in e_candidates:
@@ -1030,115 +1044,166 @@ def run_coord_ocr(output_json_path, folder_path, group_id=None):
                     print("--------------------------------------------------")
 
                     res = {"N": "N/A", "E": "N/A", "H_Z": "N/A"}
-                    
-                    # 1. 找出所有的數字以及它們在字串中的起迄位置 (包含負號、小數點)
-                    num_matches = list(re.finditer(r'-?\d+(?:\.\d+)?', text))
-                    
-                    coord_n, coord_e, coord_z = None, None, None
-                    n_match_obj, e_match_obj = None, None
 
-                    # 2. 精準定錨 N 和 E (N 為 7 位整數，E 為 6 位整數)
-                    for m in num_matches:
-                        val_str = m.group()
-                        int_digits = len(val_str.split('.')[0].lstrip('-'))
-                        
-                        if int_digits == 6 and coord_e is None:
-                            coord_e = val_str
-                            e_match_obj = m
-                        elif int_digits == 7 and coord_n is None:
-                            coord_n = val_str
-                            n_match_obj = m
-
-                    # 3. 如果順利找到 N 和 E，利用「物理行」與「關鍵字」精準定位 Z
-                    if coord_n and coord_e:
-                        res["N"] = coord_n
-                        res["E"] = coord_e
-                        
-                        # 將文字依換行符號切分，並找出 N 和 E 落在哪些行
-                        lines = [line.strip() for line in text.split('\n') if line.strip()]
-                        target_line_indices = set()
-                        
-                        for idx, line in enumerate(lines):
-                            if coord_n in line or coord_e in line:
-                                target_line_indices.add(idx)
-                        
-                        # 收集 N/E 所在行，以及其上下各 2 行的範圍，這絕對包含了真正的 Z
-                        candidate_lines = []
-                        if target_line_indices:
-                            min_idx = max(0, min(target_line_indices) - 1) # 優先看上一行或同一行開始
-                            max_idx = min(len(lines) - 1, max(target_line_indices) + 2)
-                            
-                            # 排序優先級：同一行 -> 下一行 -> 下下一行 -> 上一行
-                            search_order = []
-                            for idx in sorted(target_line_indices):
-                                search_order.append(idx)       # 同一行
-                                if idx + 1 < len(lines): search_order.append(idx + 1) # 下一行
-                                if idx + 2 < len(lines): search_order.append(idx + 2) # 下下一行
-                                if idx - 1 >= 0: search_order.append(idx - 1)         # 上一行
-                            
-                            # 去除重複的行索引並保持順序
-                            seen_idx = set()
-                            final_order = [i for i in search_order if not (i in seen_idx or seen_idx.add(i))]
-                            candidate_lines = [(lines[i], i) for i in final_order if i < len(lines)]
+                    # ============================================================
+                    # 【最優先】NEZ: x, y, z 逗號分隔格式（如 "NEZ: 207130.674, 2595082.704, 297.498"）
+                    # ============================================================
+                    nez_comma_match = re.search(
+                        r'NEZ\s*[:\s]\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)',
+                        text, re.IGNORECASE
+                    )
+                    if nez_comma_match:
+                        raw_e, raw_n, raw_z = nez_comma_match.group(1), nez_comma_match.group(2), nez_comma_match.group(3)
+                        # NEZ 格式順序為 E, N, Z — 根據位數驗證後指派
+                        candidates = [raw_e, raw_n, raw_z]
+                        coord_n, coord_e, coord_z = None, None, None
+                        for c in candidates:
+                            int_len = len(c.split('.')[0].lstrip('-'))
+                            if int_len == 7 and coord_n is None:
+                                coord_n = c
+                            elif int_len == 6 and coord_e is None:
+                                coord_e = c
+                            elif 1 <= int_len <= 4 and coord_z is None:
+                                coord_z = c
+                        if coord_n and coord_e and coord_z:
+                            res["N"] = coord_n
+                            res["E"] = coord_e
+                            res["H_Z"] = coord_z
+                            print(f"  [NEZ逗號格式] N={coord_n}, E={coord_e}, Z={coord_z}")
+                            # 直接跳到結尾，不再往下執行
+                            pass
                         else:
-                            # 如果沒對應到行，直接用整段文字當候選
-                            candidate_lines = [(text, 0)]
+                            print(f"  [NEZ逗號格式] 找到但位數驗證失敗，繼續往下解析")
+                            nez_comma_match = None  # 重設，讓後續邏輯接手
 
-                        z_found = False
-                        
-                        # 分層權重搜尋
-                        for context_line, line_num in candidate_lines:
-                            if z_found:
-                                break
-                            
-                            # 排除包含「天線、ant、北、東」等干擾字眼
-                            if any(k in context_line.lower() for k in ['天線', '天线', 'ant', '北', '東', '东']):
-                                # 如果該行同時包含高程與天線，先試著把天線部分抹除
-                                context_line = re.sub(r'.*?(?:天線|天线|ant|antenna)[^0-9]*?\d+(?:\.\d+)?', '', context_line, flags=re.IGNORECASE)
+                    # ============================================================
+                    # 若 NEZ 逗號格式未成功，執行原有邏輯
+                    # ============================================================
+                    if res["N"] == "N/A" or res["E"] == "N/A" or res["H_Z"] == "N/A":
 
-                            # 【第一層優先】明確定錨：高程、正高、高、H、Z、EL
-                            z_match = re.search(r'(?:高程|正高|高|\b[ZHzh]|\bEL)[:=\s\n]*(-?\d+(?:\.\d+)?)', context_line, re.IGNORECASE)
-                            
-                            # 【第二層盲猜】如果該行有標籤但沒抓到，直接抓該行任何不是 N 和 E 的合理浮點數/小數
-                            if not z_match:
-                                line_nums = re.findall(r'-?\d+(?:\.\d+)?', context_line)
-                                for num in line_nums:
-                                    if num != coord_n and num != coord_e:
-                                        # 檢查合理性：整數部分 1~4 位
+                        num_matches = list(re.finditer(r'-?\d+(?:\.\d+)?', text))
+                        coord_n, coord_e, coord_z = None, None, None
+                        n_match_obj, e_match_obj = None, None
+
+                        # 1. 精準定錨 N（7位整數）和 E（6位整數）
+                        for m in num_matches:
+                            val_str = m.group()
+                            int_digits = len(val_str.split('.')[0].lstrip('-'))
+                            if int_digits == 6 and coord_e is None:
+                                coord_e = val_str
+                                e_match_obj = m
+                            elif int_digits == 7 and coord_n is None:
+                                coord_n = val_str
+                                n_match_obj = m
+
+                        if coord_n and coord_e:
+                            res["N"] = coord_n
+                            res["E"] = coord_e
+
+                            lines = [line.strip() for line in text.split('\n') if line.strip()]
+
+                            # ============================================================
+                            # 【修正核心】先對全文做「明確標籤定錨」（Z/H/高程），
+                            # 不依賴物理行搜尋順序，直接掃描所有行找含 Z 標籤的那行
+                            # ============================================================
+                            z_label_pattern = re.compile(
+                                r'(?:高程|正高|\b[Zz]\s*[:：=\s]|EL\s*[:：=\s])',
+                                re.IGNORECASE
+                            )
+                            # 排除 sigma/精度干擾行的關鍵字（o:、σ:、sigma、PDOP、HDOP 等）
+                            sigma_keywords = re.compile(
+                                r'\b(?:sigma|pdop|hdop|vdop|rdop|dop)\b|(?:^|\s)[oO]\s*[:：]',
+                                re.IGNORECASE
+                            )
+
+                            z_found = False
+
+                            # 【第一輪】全行掃描，找有明確 Z/高程標籤的行（跳過 sigma 行）
+                            for line in lines:
+                                if z_found:
+                                    break
+                                if sigma_keywords.search(line):
+                                    continue
+                                z_match = z_label_pattern.search(line)
+                                if z_match:
+                                    nums_in_line = re.findall(r'-?\d+(?:\.\d+)?', line)
+                                    for num in nums_in_line:
+                                        if num == coord_n or num == coord_e:
+                                            continue
+                                        try:
+                                            z_val = float(num)
+                                        except ValueError:
+                                            continue
+                                        z_int_len = len(num.split('.')[0].lstrip('-'))
+                                        if 1 <= z_int_len <= 4:
+                                            coord_z = num
+                                            z_found = True
+                                            print(f"  [全文標籤定錨成功] Z = {coord_z}（行內容: {line!r}）")
+                                            break
+
+                            # 【第二輪】仍未找到 Z，退回物理行鄰近盲猜（排除 sigma 行）
+                            if not z_found:
+                                target_line_indices = set()
+                                for idx, line in enumerate(lines):
+                                    if coord_n in line or coord_e in line:
+                                        target_line_indices.add(idx)
+
+                                search_order = []
+                                for idx in sorted(target_line_indices):
+                                    search_order.append(idx)
+                                    if idx + 1 < len(lines): search_order.append(idx + 1)
+                                    if idx + 2 < len(lines): search_order.append(idx + 2)
+                                    if idx - 1 >= 0: search_order.append(idx - 1)
+
+                                seen_idx = set()
+                                final_order = [i for i in search_order if not (i in seen_idx or seen_idx.add(i))]
+                                candidate_lines = [(lines[i], i) for i in final_order if i < len(lines)]
+
+                                for context_line, line_num in candidate_lines:
+                                    if z_found:
+                                        break
+                                    # 跳過 sigma/精度干擾行
+                                    if sigma_keywords.search(context_line):
+                                        print(f"  [盲猜] 跳過 sigma 干擾行 {line_num}: {context_line!r}")
+                                        continue
+                                    if any(k in context_line.lower() for k in ['天線', '天线', 'ant', '北', '東', '东']):
+                                        context_line = re.sub(
+                                            r'.*?(?:天線|天线|ant|antenna)[^0-9]*?\d+(?:\.\d+)?', '',
+                                            context_line, flags=re.IGNORECASE
+                                        )
+                                    line_nums = re.findall(r'-?\d+(?:\.\d+)?', context_line)
+                                    for num in line_nums:
+                                        if num == coord_n or num == coord_e:
+                                            continue
+                                        try:
+                                            z_val = float(num)
+                                        except ValueError:
+                                            continue
+                                        if abs(z_val) < 1:
+                                            continue
                                         z_int_len = len(num.split('.')[0].lstrip('-'))
                                         if 1 <= z_int_len <= 4:
                                             coord_z = num
                                             z_found = True
                                             print(f"  [物理行盲猜成功] 行 {line_num}: 排除 NE 後找到合理數值 Z = {coord_z}")
                                             break
+
+                            # 防錯補位（個位數前字元補位）
+                            if coord_z and len(coord_z.split('.')[0]) == 1:
+                                z_idx = text.find(coord_z)
+                                if z_idx > 0 and text[z_idx - 1].isdigit():
+                                    coord_z = text[z_idx - 1] + coord_z
+                                    print(f"  [防錯補位] 修正為: {coord_z}")
+
+                            if coord_z:
+                                res["H_Z"] = coord_z
                             else:
-                                potential_z = z_match.group(1)
-                                if potential_z != coord_n and potential_z != coord_e:
-                                    z_int_len = len(potential_z.split('.')[0].lstrip('-'))
-                                    if 1 <= z_int_len <= 4:
-                                        coord_z = potential_z
-                                        z_found = True
-                                        print(f"  [物理行標籤定錨成功] 行 {line_num}: 識別出高程 Z = {coord_z}")
-                                        break
+                                print("  [Class 7 警告] 已識別出 N 和 E，但找不到合理的高程 Z 數值")
 
-                        # --- 【修正：移除舊有容易造成混淆的單位數數字補位邏輯】 ---
-                        # 如果抓到的 Z 依然是個位數，且後面有小數點，只做前後字元檢查，不做強行補 2 或 7
-                        if coord_z and len(coord_z.split('.')[0]) == 1:
-                            z_idx = text.find(coord_z)
-                            if z_idx > 0 and text[z_idx - 1].isdigit():
-                                coord_z = text[z_idx - 1] + coord_z
-                                print(f"  [防錯補位] 偵測到 Z 為個位數且前字元為數字，修正為: {coord_z}")
-
-                        # 寫入結果
-                        if coord_z:
-                            res["H_Z"] = coord_z
-                        else:
-                            print("  [Class 7 警告] 已識別出 N 和 E，但在鄰近行找不到合理的高程 Z 數值")
-
-                    # 5. 終極 Fallback：如果連 N(7位) 或 E(6位) 都沒撈齊，才退回原本的萬用正則
+                    # 5. 終極 Fallback
                     if any(v == "N/A" for v in [res["N"], res["E"]]):
                         print("  [Class 7 警告] 無法依位數特徵配對出 NE，改採萬用規則。")
-                        res = _match_coord(text, _COORD_PATTERNS)     
+                        res = _match_coord(text, _COORD_PATTERNS)    
                 elif class_id in _CLASS_PATTERNS:
                     if class_id in [4, 5]:
                         print(f"\n--- [DEBUG Class {class_id} OCR 文字] 檔案: {os.path.basename(fp)} ---")
