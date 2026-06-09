@@ -1,0 +1,63 @@
+def _detect_rulers_combined(img_path, yolo_model):
+    import cv2
+    
+    img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return False, False, False, [], []
+    
+    h_img, w_img = img.shape[:2]
+    
+    # ── YOLO 找垂直尺位置 ──────────────────────
+    pil = Image.open(img_path).convert("RGB")
+    arr = np.array(pil)
+    preds = yolo_model.predict(source=arr, verbose=False)[0]
+    
+    v_boxes = []
+    for box in preds.boxes:
+        if float(box.conf[0].item()) > 0.05:
+            xyxy = box.xyxy[0].tolist()
+            if int(box.cls[0].item()) == 1:  # 垂直尺的 class
+                v_boxes.append(xyxy)
+    
+    # YOLO 找不到垂直尺 → fallback 到 HSV 黃色偵測
+    if not v_boxes:
+        _, _, _, v_boxes, _ = _detect_rulers_ac(img_path)
+    
+    has_vertical = len(v_boxes) > 0
+    
+    # ── 在垂直尺「左右擴展區域」用 Hough 找水平依靠物 ──
+    gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray  = clahe.apply(gray)
+    edges = cv2.Canny(gray, 30, 100, apertureSize=3)
+    
+    min_len = int(w_img * 0.15)  # 降低門檻
+    lines   = cv2.HoughLinesP(edges, 1, np.pi / 180,
+                               threshold=50, minLineLength=min_len, maxLineGap=30)
+    h_lines = []
+    if lines is not None:
+        for x1, y1, x2, y2 in lines[:, 0]:
+            angle = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+            if angle < 30 or angle > 150:
+                h_lines.append((x1, y1, x2, y2))
+    
+    # ── 判斷水平線是否在尺的高度範圍內（依靠偵測）──
+    has_horizontal = False
+    is_crossed     = False
+    
+    for vx1, vy1, vx2, vy2 in v_boxes:
+        for hx1, hy1, hx2, hy2 in h_lines:
+            line_y = (hy1 + hy2) / 2
+            # 水平線的 y 落在尺的高度範圍內
+            if vy1 <= line_y <= vy2:
+                has_horizontal = True
+                vcx = (vx1 + vx2) / 2
+                hx_lo = min(hx1, hx2) - 50   # 加容差
+                hx_hi = max(hx1, hx2) + 50
+                if hx_lo <= vcx <= hx_hi:
+                    is_crossed = True
+                    break
+        if is_crossed:
+            break
+    
+    return has_vertical, has_horizontal, is_crossed, v_boxes, h_lines
