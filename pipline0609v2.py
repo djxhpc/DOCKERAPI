@@ -32,27 +32,36 @@ import cv2
 #   output_dir : 全域整合 JSON 的輸出目錄
 #   job_name   : 輸出檔名前綴與日誌顯示名稱
 JOBS = [
-    {
-        "source_dir": r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\111\桿件\桿件埋深-照片",
-        "steps":      ["ruler_ac", "yolo"],
-        "output_dir": r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\117\新輸出",
-        "job_name":   "111桿件埋深-照片test",
-    },
-    # 新增更多任務範例：
     # {
-    #     "source_dir": r"D:\Chiayi_AI\116\一等水準點照片",
-    #     "steps":      ["benchmark"],
-    #     "output_dir": r"D:\Chiayi_AI\116\新輸出",
-    #     "job_name":   "116水準點",
+    #     "source_dir": r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\111\桿件\桿件埋深-照片",
+    #     "steps":      ["ruler_ac", "yolo"],
+    #     "output_dir": r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\117\新輸出",
+    #     "job_name":   "111桿件埋深-照片test",
     # },
+    # 新增更多任務範例：
+    {
+        "source_dir": r"D:\work2\0526ocr\testorror\尺規",
+        "steps":      ["ruler_ac", "yolo"],
+        "output_dir": r"D:\work2\0526ocr\testorror\新輸出",
+        "job_name":   "117尺規",
+    },
 ]
 
 # ── 工具路徑 ──────────────────────────────────
-YOLO_MODEL_PATH    = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\117\尺規best.pt"
+YOLO_MODEL_PATH    = r"D:\work2\0526ocr\best.pt"
 RULER_YOLO_ENABLED = True  # False = 只跑 ruler_ac（A+C法），跳過 YOLO 尺規辨識
 
+# ── YOLO垂直尺 + 接觸偵測（ruler_yc）─────────────────
+# 只用 YOLO 偵測垂直尺（class 1），再在尺的周圍搜尋是否有物體靠著，
+# 完全不需要判斷水平物體是什麼種類。
+RULER_YC_ENABLED      = True
+RULER_YC_MODEL_PATH   = YOLO_MODEL_PATH  # 共用同一模型
+RULER_YC_CONF         = 0.1    # 垂直尺偵測信心閾值
+RULER_YC_EXPAND_RATIO = 2.5    # 搜尋帶向外延伸倍數（相對於尺的寬度）
+RULER_YC_LINE_RATIO   = 0.10   # 搜尋帶內最小有效水平線長度（佔帶寬比例）
+
 # ── 水準點 YOLO 輔助裁切（訓練完模型後將 BENCHMARK_YOLO_CROP 改為 True）──
-BENCHMARK_YOLO_CROP       = True                       # False = 停用；True = 啟用
+BENCHMARK_YOLO_CROP       = False                      # False = 停用；True = 啟用
 BENCHMARK_YOLO_MODEL_PATH = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\117\尺規best.pt" # 訓練好的一等水準點偵測模型
 BENCHMARK_YOLO_CONF       = 0.25   # 偵測信心閾值（低一點避免漏偵測）
 BENCHMARK_YOLO_PADDING    = 0.3    # 裁切框四周額外留邊比例（相對於框的寬/高）
@@ -70,8 +79,8 @@ HOUGH_MIN_LINE_RATIO = 0.15
 # 多個關鍵字可同時命中，步驟取聯集。
 FOLDER_RULES = {
     # "埋深":  ["ruler_ac", "yolo"],
-    "桿件埋深-照片":  ["ruler_ac", "yolo"],
-    #
+    # "桿件埋深-照片":  ["ruler_ac", "yolo"],
+    "尺規":  ["ruler_ac", "yolo"],
     # "一等水準點照片": ["benchmark"],
     # "測量讀數照片": ["coord_ocr"],
     # "測量坐標讀數": ["coord_ocr"],
@@ -113,8 +122,8 @@ PHASH_SUSPECTED_THRESHOLD = 8     # pHash(16) Hamming 距離 ≤ 此值視為疑
 
 # ── 座標 OCR YOLO 格式分類（訓練完模型後將 COORD_YOLO_ENABLED 改為 True）──
 COORD_YOLO_ENABLED    = False                        # False = 停用；True = 啟用
-# COORD_YOLO_MODEL_PATH = r"D:\work2\0526ocr\best2.pt"
-COORD_YOLO_MODEL_PATH = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\117\判斷格式分類best2.pt" # 訓練好的座標格式分類模型
+COORD_YOLO_MODEL_PATH = r"D:\work2\0526ocr\best2.pt"
+# COORD_YOLO_MODEL_PATH = r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\117\判斷格式分類best2.pt" # 訓練好的座標格式分類模型
 COORD_YOLO_CONF       = 0.1  # 低於此信心值 → fallback 到全格式模式（類別 9）
 # 模型輸出類別名稱 → 格式代號（1–8），依訓練時設定的 CLASS_DIRS key 填寫；未列出的 → 9（全模式）
 COORD_YOLO_CLASS_MAP  = {
@@ -400,7 +409,7 @@ def run_yolo(output_json_path, folder_path, model_path):
     else:
         report = {
             "summary": {k: 0 for k in [
-                "total_images", "both_detected_crossed", "both_detected_not_crossed",
+                "total_images", "both_detected_crossed",
                 "vertical_only", "horizontal_only", "none_detected", "file_read_errors"
             ]},
             "results_list": []
@@ -436,22 +445,23 @@ def run_yolo(output_json_path, folder_path, model_path):
 
         preds = model.predict(source=arr, verbose=False)[0]
         vb, hb = [], []
-        for box in preds.boxes:
+        for box in (preds.boxes or []):
             if float(box.conf[0].item()) > 0.05:
                 xyxy = box.xyxy[0].tolist()
                 (vb if int(box.cls[0].item()) == 1 else hb).append(xyxy)
 
         vc, hc = len(vb), len(hb)
         if vc == 0 and hc == 0:
-            status = "None Detected";               sm["none_detected"] += 1
+            status = "None Detected";           sm["none_detected"] += 1
         elif vc > 0 and hc == 0:
-            status = "Vertical Only";               sm["vertical_only"] += 1
+            status = "Vertical Only";           sm["vertical_only"] += 1
         elif vc == 0 and hc > 0:
-            status = "Horizontal Only";             sm["horizontal_only"] += 1
+            status = "Horizontal Only";         sm["horizontal_only"] += 1
         elif any(_bbox_crossed(b1, b2) for b1 in vb for b2 in hb):
-            status = "Both Detected (Crossed)";     sm["both_detected_crossed"] += 1
+            status = "Both Detected (Crossed)"; sm["both_detected_crossed"] += 1
         else:
-            status = "Both Detected (Not Crossed)"; sm["both_detected_not_crossed"] += 1
+            # 可視範圍不重疊 → 視同 None Detected
+            status = "None Detected";           sm["none_detected"] += 1
 
         rec.update(status=status, detections={"vertical_count": vc, "horizontal_count": hc})
         report["results_list"].append(rec)
@@ -516,6 +526,95 @@ def _ruler_band_has_yellow(img_hsv, y_lo, y_hi, x_lo, x_hi,
     return (mask > 0).mean() >= ratio
 
 
+def _has_ruler_stripes(img_gray, y_lo, y_hi, x_lo, x_hi, min_alternations=4):
+    """
+    檢查指定水平帶內是否有尺規的等間距刻度條紋。
+    沿 x 方向計算每列灰階均值，形成 1D 信號後統計明暗交替次數。
+    尺規有規律黑白條紋（≥ min_alternations 次交替），棍子/桿件無此特徵。
+    """
+    roi = img_gray[max(0, y_lo):y_hi, max(0, x_lo):x_hi]
+    if roi.size == 0 or roi.shape[1] < 10:
+        return False
+
+    # 每列均值 → 1D 亮度信號
+    col_means = roi.mean(axis=0).astype(float)
+
+    # 平滑（避免感光雜訊造成假交替）
+    kernel_size = max(3, len(col_means) // 40)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    smoothed = np.convolve(col_means, np.ones(kernel_size) / kernel_size, mode='valid')
+    if len(smoothed) < 4:
+        return False
+
+    # 以中位數為分界，計算高低交替次數
+    threshold = np.median(smoothed)
+    above = smoothed > threshold
+    alternations = int(np.sum(np.diff(above.astype(int)) != 0))
+    return alternations >= min_alternations
+
+
+def _detect_contact_near_vertical(gray, vbox, h_img, w_img,
+                                   expand_ratio=2.5, min_line_ratio=0.10):
+    """
+    在已知垂直尺的 bbox 左右延伸帶內，偵測是否有任何物體靠著尺。
+
+    判斷邏輯：
+    1. 線段必須水平（±20°）
+    2. 至少有一端延伸到尺規 x 範圍外（排除尺自身邊緣誤觸發）
+    3. 排除「貫穿型背景物件」：若線段同時在尺規左右兩側都延伸超過
+       PASSTHROUGH_RATIO × 尺寬，代表棍子/管子是斜穿整個畫面的背景物，
+       與尺在不同深度，視為不接觸。
+    """
+    PASSTHROUGH_RATIO = 1.5   # 雙側超出此倍數的尺寬 → 視為背景貫穿物
+
+    vx1, vy1, vx2, vy2 = [int(v) for v in vbox]
+    ruler_w = max(vx2 - vx1, 1)
+    ext  = int(ruler_w * expand_ratio)
+    sx1  = max(0, vx1 - ext)
+    sx2  = min(w_img, vx2 + ext)
+    sy1  = max(0, vy1)
+    sy2  = min(h_img, vy2)
+
+    zone  = gray[sy1:sy2, sx1:sx2]
+    if zone.size == 0:
+        return False
+
+    edges = cv2.Canny(zone, 50, 150, apertureSize=3)
+    min_len = max(10, int((sx2 - sx1) * min_line_ratio))
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180,
+                             threshold=40,
+                             minLineLength=min_len,
+                             maxLineGap=20)
+    if lines is None:
+        return False
+
+    passthrough_thresh = ruler_w * PASSTHROUGH_RATIO
+
+    for x1, y1, x2, y2 in lines[:, 0]:
+        angle = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+        if not (angle < 20 or angle > 160):
+            continue  # 非水平線
+
+        abs_x1 = sx1 + min(x1, x2)
+        abs_x2 = sx1 + max(x1, x2)
+
+        left_overhang  = vx1 - abs_x1   # 正值 = 延伸到尺規左側
+        right_overhang = abs_x2 - vx2   # 正值 = 延伸到尺規右側
+
+        # 條件 2：至少一端超出尺規範圍
+        if not (left_overhang > 3 or right_overhang > 3):
+            continue
+
+        # 條件 3：排除雙側都大幅超出的貫穿型背景物件
+        if left_overhang > passthrough_thresh and right_overhang > passthrough_thresh:
+            continue
+
+        return True
+
+    return False
+
+
 def _detect_rulers_ac(img_path):
     """
     偵測單張圖片中的直尺（C法：黃色HSV）與水平尺規（A法：Hough線群）。
@@ -532,6 +631,14 @@ def _detect_rulers_ac(img_path):
     img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         return False, False, False, [], []
+
+    # EXIF 轉正（手機直拍圖 EXIF 方向未套用會導致垂直/水平誤判）
+    try:
+        pil_tmp = Image.open(img_path)
+        pil_tmp = ImageOps.exif_transpose(pil_tmp)
+        img = cv2.cvtColor(np.array(pil_tmp.convert("RGB")), cv2.COLOR_RGB2BGR)
+    except Exception:
+        pass
 
     h_img, w_img = img.shape[:2]
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -615,17 +722,23 @@ def _detect_rulers_ac(img_path):
             valid_h_ruler_bands.append(group)
             continue
 
-        # 單條線 → 進行黃色紋理驗證
+        # 單條線 → 黃色紋理 AND 刻度條紋同時滿足才視為尺規（排除棍子/桿件）
         x1, y1, x2, y2 = group[0]
         y_center = int((y1 + y2) / 2)
         x_lo     = min(x1, x2)
         x_hi     = max(x1, x2)
-        if _ruler_band_has_yellow(hsv,
-                                   y_center - BAND_HALF,
-                                   y_center + BAND_HALF,
-                                   x_lo, x_hi,
-                                   YELLOW_HSV_LOWER, YELLOW_HSV_UPPER,
-                                   ratio=0.03):
+        has_yellow   = _ruler_band_has_yellow(hsv,
+                                              y_center - BAND_HALF,
+                                              y_center + BAND_HALF,
+                                              x_lo, x_hi,
+                                              YELLOW_HSV_LOWER, YELLOW_HSV_UPPER,
+                                              ratio=0.03)
+        has_stripes  = _has_ruler_stripes(gray,
+                                          y_center - BAND_HALF * 2,
+                                          y_center + BAND_HALF * 2,
+                                          x_lo, x_hi,
+                                          min_alternations=4)
+        if has_yellow and has_stripes:
             valid_h_ruler_bands.append(group)
         # 否則視為棍子/桿子，丟棄
 
@@ -647,6 +760,7 @@ def _detect_rulers_ac(img_path):
     # 交叉判斷（直立尺 ∩ 水平尺）
     # ══════════════════════════════════════════════════════
     is_crossed = False
+    CROSS_TOL  = 40  # 交叉判斷容差（px），避免尺/線稍微錯位就漏判
     if has_vertical and has_horizontal:
         for hx1, hy1, hx2, hy2 in all_h_lines:
             hcy   = (hy1 + hy2) / 2
@@ -654,7 +768,8 @@ def _detect_rulers_ac(img_path):
             hx_hi = max(hx1, hx2)
             for vx1, vy1, vx2, vy2 in v_boxes:
                 vcx = (vx1 + vx2) / 2
-                if (vy1 <= hcy <= vy2) and (hx_lo <= vcx <= hx_hi):
+                if ((vy1 - CROSS_TOL <= hcy <= vy2 + CROSS_TOL) and
+                        (hx_lo - CROSS_TOL <= vcx <= hx_hi + CROSS_TOL)):
                     is_crossed = True
                     break
             if is_crossed:
@@ -678,7 +793,7 @@ def run_ruler_ac(output_json_path, folder_path):
     else:
         report = {
             "summary": {k: 0 for k in [
-                "total_images", "both_detected_crossed", "both_detected_not_crossed",
+                "total_images", "both_detected_crossed",
                 "vertical_only", "horizontal_only", "none_detected", "file_read_errors"
             ]},
             "results_list": []
@@ -710,15 +825,16 @@ def run_ruler_ac(output_json_path, folder_path):
             continue
 
         if not has_v and not has_h:
-            status = "None Detected";               sm["none_detected"] += 1
+            status = "None Detected";           sm["none_detected"] += 1
         elif has_v and not has_h:
-            status = "Vertical Only";               sm["vertical_only"] += 1
+            status = "Vertical Only";           sm["vertical_only"] += 1
         elif not has_v and has_h:
-            status = "Horizontal Only";             sm["horizontal_only"] += 1
+            status = "Horizontal Only";         sm["horizontal_only"] += 1
         elif crossed:
-            status = "Both Detected (Crossed)";     sm["both_detected_crossed"] += 1
+            status = "Both Detected (Crossed)"; sm["both_detected_crossed"] += 1
         else:
-            status = "Both Detected (Not Crossed)"; sm["both_detected_not_crossed"] += 1
+            # 可視範圍不重疊 → 視同 None Detected
+            status = "None Detected";           sm["none_detected"] += 1
 
         rec.update(status=status, detections={"has_vertical": has_v, "has_horizontal": has_h})
         report["results_list"].append(rec)
@@ -730,6 +846,97 @@ def run_ruler_ac(output_json_path, folder_path):
     with open(results_path, 'w', encoding='utf-8') as f:
         json.dump(report, f, ensure_ascii=False, indent=4)
     print(f"  [尺規A+C] 完成！結果儲存至: {results_path}")
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 2a-yc  YOLO垂直尺 + 接觸偵測（ruler_yc）
+#   只偵測垂直尺（class 1），在尺的鄰近帶用 Hough 判斷是否有物體靠著，
+#   不需要分類水平物件種類。
+# ─────────────────────────────────────────────────────────────
+
+def run_ruler_yolo_contact(output_json_path, folder_path, model_path):
+    """
+    增量 YOLO垂直尺＋接觸偵測。
+    結果附加至 <output_dir>/ruler_yc_results.json。
+    """
+    from ultralytics import YOLO as YOLOModel
+
+    out_dir      = os.path.dirname(output_json_path)
+    results_path = os.path.join(out_dir, "ruler_yc_results.json")
+
+    if os.path.exists(results_path):
+        with open(results_path, 'r', encoding='utf-8') as f:
+            report = json.load(f)
+    else:
+        report = {
+            "summary": {k: 0 for k in [
+                "total_images", "both_detected_crossed",
+                "vertical_only", "none_detected", "file_read_errors"
+            ]},
+            "results_list": []
+        }
+
+    done = {r["filename"] for r in report["results_list"]}
+
+    with open(output_json_path, 'r', encoding='utf-8') as f:
+        new_items = [it for it in json.load(f) if it.get("images") and it["images"] not in done]
+
+    if not new_items:
+        print("  [尺規YC] 無新照片需處理。")
+        return
+
+    print(f"  [尺規YC] 載入模型: {model_path}")
+    model = YOLOModel(model_path)
+    print(f"  [尺規YC] 開始辨識 {len(new_items)} 張新照片...")
+
+    sm = report["summary"]
+    for idx, item in enumerate(new_items, 1):
+        fn  = item["images"]
+        fp  = os.path.join(folder_path, fn)
+        rec = {"filename": fn, "absolute_path": os.path.abspath(fp)}
+
+        try:
+            # EXIF 轉正
+            pil = Image.open(fp)
+            pil = ImageOps.exif_transpose(pil).convert("RGB")
+            arr = np.array(pil)
+            img_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            gray    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            h_img, w_img = gray.shape[:2]
+        except Exception as e:
+            rec.update(status="Error", reason=str(e))
+            sm["file_read_errors"] += 1
+            report["results_list"].append(rec)
+            continue
+
+        preds = model.predict(source=arr, verbose=False)[0]
+        vboxes = [
+            box.xyxy[0].tolist()
+            for box in (preds.boxes or [])
+            if float(box.conf[0].item()) >= RULER_YC_CONF
+            and int(box.cls[0].item()) == 1   # class 1 = 垂直尺
+        ]
+
+        if not vboxes:
+            status = "None Detected"; sm["none_detected"] += 1
+        elif any(_detect_contact_near_vertical(
+                     gray, vb, h_img, w_img,
+                     RULER_YC_EXPAND_RATIO, RULER_YC_LINE_RATIO)
+                 for vb in vboxes):
+            status = "Both Detected (Crossed)"; sm["both_detected_crossed"] += 1
+        else:
+            status = "Vertical Only"; sm["vertical_only"] += 1
+
+        rec.update(status=status, detections={"vertical_count": len(vboxes)})
+        report["results_list"].append(rec)
+
+        if idx % 100 == 0 or idx == len(new_items):
+            print(f"  [尺規YC] 進度: {idx}/{len(new_items)}")
+
+    sm["total_images"] = len(report["results_list"])
+    with open(results_path, 'w', encoding='utf-8') as f:
+        json.dump(report, f, ensure_ascii=False, indent=4)
+    print(f"  [尺規YC] 完成！結果儲存至: {results_path}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1141,29 +1348,50 @@ def run_coord_ocr(output_json_path, folder_path, engine, coord_yolo):
                     print(text if text else "(完全沒有辨識出任何文字)")
                     print("--------------------------------------------------")
 
-                    cleaned_text = text.replace(" ", "")
-
-                    # 第一優先：緊湊格式（N/E/Z 直接相連，無換行）
-                    pattern_nez_strict = (
-                        r'[NN](?::|=)?' + _NUM +
-                        r'[EE](?::|=)?' + _NUM +
-                        r'[ZZ27z](?::|=)?' + _NUM
+                    # 最優先：NEZ: x, y, z 逗號格式（E 在前、N 在後，與 class 7 相同處理）
+                    _nez_c2_matched = re.search(
+                        r'NEZ\s*[:\s]\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)',
+                        text, re.IGNORECASE
                     )
-                    m_strict = re.search(pattern_nez_strict, cleaned_text, re.IGNORECASE)
+                    if _nez_c2_matched:
+                        _c2_cands = [_nez_c2_matched.group(1), _nez_c2_matched.group(2), _nez_c2_matched.group(3)]
+                        _c2_n = _c2_e = _c2_z = None
+                        for c in _c2_cands:
+                            il = len(c.split('.')[0].lstrip('-'))
+                            if il == 7 and _c2_n is None: _c2_n = c
+                            elif il == 6 and _c2_e is None: _c2_e = c
+                            elif 1 <= il <= 4 and _c2_z is None: _c2_z = c
+                        if _c2_n and _c2_e and _c2_z:
+                            res = {"N": _c2_n, "E": _c2_e, "H_Z": _c2_z}
+                            print(f"  [Class2 NEZ逗號格式] N={_c2_n}, E={_c2_e}, Z={_c2_z}")
+                            _nez_c2_matched = True  # 標記成功，跳過後續解析
+                        else:
+                            _nez_c2_matched = None  # 位數驗證失敗，繼續往下
 
-                    if m_strict:
-                        res = {"N": m_strict.group(1), "E": m_strict.group(2), "H_Z": m_strict.group(3)}
-                    else:
-                        # 第二優先：標籤與數值分行（N 獨立在行首，避免誤抓 σN/σE/σZ）
-                        # (?:^|\n)\s* 確保 N/E/Z 出現在行首，σN 前有 σ 字元故不符合
-                        n_m = re.search(r'(?:^|\n)\s*[NN]\s*[\n:=]\s*' + _NUM, text, re.IGNORECASE)
-                        e_m = re.search(r'(?:^|\n)\s*[EE]\s*[\n:=]\s*' + _NUM, text, re.IGNORECASE)
-                        z_m = re.search(r'(?:^|\n)\s*[ZZ27z]\s*[\n:=]\s*' + _NUM, text, re.IGNORECASE)
-                        res = {
-                            "N":   n_m.group(1) if n_m else "N/A",
-                            "E":   e_m.group(1) if e_m else "N/A",
-                            "H_Z": z_m.group(1) if z_m else "N/A",
-                        }
+                    if not _nez_c2_matched:
+                        cleaned_text = text.replace(" ", "")
+
+                        # 第一優先：緊湊格式（N/E/Z 直接相連，無換行）
+                        pattern_nez_strict = (
+                            r'[NN](?::|=)?' + _NUM +
+                            r'[EE](?::|=)?' + _NUM +
+                            r'[ZZ27z](?::|=)?' + _NUM
+                        )
+                        m_strict = re.search(pattern_nez_strict, cleaned_text, re.IGNORECASE)
+
+                        if m_strict:
+                            res = {"N": m_strict.group(1), "E": m_strict.group(2), "H_Z": m_strict.group(3)}
+                        else:
+                            # 第二優先：標籤與數值分行（N 獨立在行首，避免誤抓 σN/σE/σZ）
+                            # (?:^|\n)\s* 確保 N/E/Z 出現在行首，σN 前有 σ 字元故不符合
+                            n_m = re.search(r'(?:^|\n)\s*[NN]\s*[\n:=]\s*' + _NUM, text, re.IGNORECASE)
+                            e_m = re.search(r'(?:^|\n)\s*[EE]\s*[\n:=]\s*' + _NUM, text, re.IGNORECASE)
+                            z_m = re.search(r'(?:^|\n)\s*[ZZ27z]\s*[\n:=]\s*' + _NUM, text, re.IGNORECASE)
+                            res = {
+                                "N":   n_m.group(1) if n_m else "N/A",
+                                "E":   e_m.group(1) if e_m else "N/A",
+                                "H_Z": z_m.group(1) if z_m else "N/A",
+                            }
 
                     # 第三優先：N/E/Z 標籤被錯開或遺漏，或抓到的值不符合 TWD97 位數格式，改用位數 fallback
                     if not _validate_twd97(res):
@@ -1186,9 +1414,26 @@ def run_coord_ocr(output_json_path, folder_path, engine, coord_yolo):
                         if fb["N"] != "N/A" or fb["E"] != "N/A" or fb["H_Z"] != "N/A":
                             res = fb
                 elif class_id == 7:
-                    print(f"\n--- [DEBUG Class 7 OCR 文字] 檔案: {os.path.basename(fp)} ---")
+                    # ── Class 7 優先裁切底部資訊欄再 OCR（避免地圖點標籤干擾）──
+                    _c7_bottom_text = ""
+                    try:
+                        with Image.open(fp) as _c7_img:
+                            _c7_img = ImageOps.exif_transpose(_c7_img).convert('RGB')
+                            _c7_w, _c7_h = _c7_img.size
+                            # 底部約 22% 為綠色資訊欄（點號/解算/NEZ）
+                            _c7_crop = _c7_img.crop((0, int(_c7_h * 0.78), _c7_w, _c7_h))
+                        _c7_bottom_text = _ocr_with_paddle(np.array(_c7_crop), engine)
+                    except Exception:
+                        pass
+
+                    print(f"\n--- [DEBUG Class 7 底部裁切 OCR] 檔案: {os.path.basename(fp)} ---")
+                    print(_c7_bottom_text if _c7_bottom_text else "(底部裁切無文字)")
+                    print(f"--- [DEBUG Class 7 全圖 OCR 文字] ---")
                     print(text if text else "(完全沒有辨識出任何文字)")
                     print("--------------------------------------------------")
+
+                    # 底部裁切版若有 NEZ 關鍵字，優先用裁切版文字；否則用全圖文字
+                    _c7_text = _c7_bottom_text if re.search(r'NEZ', _c7_bottom_text, re.IGNORECASE) else text
 
                     res = {"N": "N/A", "E": "N/A", "H_Z": "N/A"}
 
@@ -1196,8 +1441,8 @@ def run_coord_ocr(output_json_path, folder_path, engine, coord_yolo):
                     # 【最優先】NEZ: x, y, z 逗號分隔格式（如 "NEZ: 207130.674, 2595082.704, 297.498"）
                     # ============================================================
                     nez_comma_match = re.search(
-                        r'NEZ\s*[:\s]\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)',
-                        text, re.IGNORECASE
+                        r'NEZ\s*[:\s]\s*(-?\d+(?:\.\d+)?)\s*[,\s]\s*(-?\d+(?:\.\d+)?)\s*[,\s]\s*(-?\d+(?:\.\d+)?)',
+                        _c7_text, re.IGNORECASE
                     )
                     if nez_comma_match:
                         raw_e, raw_n, raw_z = nez_comma_match.group(1), nez_comma_match.group(2), nez_comma_match.group(3)
@@ -1224,11 +1469,11 @@ def run_coord_ocr(output_json_path, folder_path, engine, coord_yolo):
                             nez_comma_match = None  # 重設，讓後續邏輯接手
 
                     # ============================================================
-                    # 若 NEZ 逗號格式未成功，執行原有邏輯
+                    # 若 NEZ 逗號格式未成功，執行原有邏輯（使用裁切優先文字）
                     # ============================================================
                     if res["N"] == "N/A" or res["E"] == "N/A" or res["H_Z"] == "N/A":
 
-                        num_matches = list(re.finditer(r'-?\d+(?:\.\d+)?', text))
+                        num_matches = list(re.finditer(r'-?\d+(?:\.\d+)?', _c7_text))
                         coord_n, coord_e, coord_z = None, None, None
                         n_match_obj, e_match_obj = None, None
 
@@ -1247,7 +1492,7 @@ def run_coord_ocr(output_json_path, folder_path, engine, coord_yolo):
                             res["N"] = coord_n
                             res["E"] = coord_e
 
-                            lines = [line.strip() for line in text.split('\n') if line.strip()]
+                            lines = [line.strip() for line in _c7_text.split('\n') if line.strip()]
 
                             # ============================================================
                             # 【修正核心】先對全文做「明確標籤定錨」（Z/H/高程），
@@ -1337,9 +1582,9 @@ def run_coord_ocr(output_json_path, folder_path, engine, coord_yolo):
 
                             # 防錯補位（個位數前字元補位）
                             if coord_z and len(coord_z.split('.')[0]) == 1:
-                                z_idx = text.find(coord_z)
-                                if z_idx > 0 and text[z_idx - 1].isdigit():
-                                    coord_z = text[z_idx - 1] + coord_z
+                                z_idx = _c7_text.find(coord_z)
+                                if z_idx > 0 and _c7_text[z_idx - 1].isdigit():
+                                    coord_z = _c7_text[z_idx - 1] + coord_z
                                     print(f"  [防錯補位] 修正為: {coord_z}")
 
                             if coord_z:
@@ -1350,7 +1595,7 @@ def run_coord_ocr(output_json_path, folder_path, engine, coord_yolo):
                     # 5. 終極 Fallback
                     if any(v == "N/A" for v in [res["N"], res["E"]]):
                         print("  [Class 7 警告] 無法依位數特徵配對出 NE，改採萬用規則。")
-                        res = _match_coord(text, _COORD_PATTERNS)    
+                        res = _match_coord(_c7_text, _COORD_PATTERNS)
                 elif class_id in _CLASS_PATTERNS:
                     if class_id in [4, 5]:
                         print(f"\n--- [DEBUG Class {class_id} OCR 文字] 檔案: {os.path.basename(fp)} ---")
@@ -1730,6 +1975,15 @@ def main():
         except Exception as e:
             print(f"[初始化] 水準點裁切模型載入失敗: {e}")
 
+    ruler_yc_model = None
+    if "ruler_yc" in all_steps and RULER_YC_ENABLED:
+        from ultralytics import YOLO as YOLOModel
+        try:
+            ruler_yc_model = YOLOModel(RULER_YC_MODEL_PATH)
+            print(f"[初始化] 尺規YC模型載入成功: {RULER_YC_MODEL_PATH}")
+        except Exception as e:
+            print(f"[初始化] 尺規YC模型載入失敗: {e}，ruler_yc 停用")
+
     classify_model = None
     if USE_CLASSIFY_MODEL:
         from ultralytics import YOLO as YOLOModel
@@ -1798,6 +2052,10 @@ def main():
             # Step 2a-alt: A+C 尺規辨識
             if "ruler_ac" in steps:
                 run_ruler_ac(output_json, root)
+
+            # Step 2a-yc: YOLO垂直尺 + 接觸偵測
+            if "ruler_yc" in steps and RULER_YC_ENABLED and ruler_yc_model is not None:
+                run_ruler_yolo_contact(output_json, root, RULER_YC_MODEL_PATH)
 
             # Step 2b: 座標 OCR
             if "coord_ocr" in steps:
