@@ -1,63 +1,257 @@
-def _detect_rulers_combined(img_path, yolo_model):
+你覺得我的尺規哪邊程式有何問題 輸出之後顯示"status": "None Detected"發現水平還是會有放東西(桿子、木棍之類)去依靠站著的尺
+有啥方法能確定水平方向沒有東西去依靠我站著的尺(黃白色尺) 但圖片有可能方向不一樣 有那種尺規在圖片中是平行的
+請直接給我能替換的所有程式碼
+# ─────────────────────────────────────────────────────────────
+# STEP 2a  YOLO 尺規辨識 (findrulerv2 邏輯)
+# ─────────────────────────────────────────────────────────────
+
+def _bbox_crossed(bv, bh):
+    vx1, vy1, vx2, vy2 = bv
+    hx1, hy1, hx2, hy2 = bh
+    # 嚴格重疊
+    if min(vx2, hx2) > max(vx1, hx1) and min(vy2, hy2) > max(vy1, hy1):
+        return True
+    vcx = (vx1 + vx2) / 2
+    hcy = (hy1 + hy2) / 2
+    # 中心點落在對方範圍內
+    if (vy1 <= hcy <= vy2) and (hx1 <= vcx <= hx2):
+        return True
+    # 50px 寬鬆容差
+    if (vy1 - 50 <= hcy <= vy2 + 50) and (hx1 - 50 <= vcx <= hx2 + 50):
+        return True
+    return False
+
+
+def run_yolo(output_json_path, folder_path, model_path):
+    """
+    增量 YOLO 尺規辨識。
+    只處理 output.json 中尚未有結果的照片。
+    結果附加至 <output_dir>/yolo_results.json。
+    """
+    from ultralytics import YOLO as YOLOModel
+
+    out_dir      = os.path.dirname(output_json_path)
+    results_path = os.path.join(out_dir, "yolo_results.json")
+
+    if os.path.exists(results_path):
+        with open(results_path, 'r', encoding='utf-8') as f:
+            report = json.load(f)
+    else:
+        report = {
+            "summary": {k: 0 for k in [
+                "total_images", "both_detected_crossed", "both_detected_not_crossed",
+                "vertical_only", "horizontal_only", "none_detected", "file_read_errors"
+            ]},
+            "results_list": []
+        }
+
+    done = {r["filename"] for r in report["results_list"]}
+
+    with open(output_json_path, 'r', encoding='utf-8') as f:
+        new_items = [it for it in json.load(f) if it.get("images") and it["images"] not in done]
+
+    if not new_items:
+        print("  [YOLO] 無新照片需處理。")
+        return
+
+    print(f"  [YOLO] 載入模型: {model_path}")
+    model = YOLOModel(model_path)
+    print(f"  [YOLO] 開始辨識 {len(new_items)} 張新照片...")
+
+    sm = report["summary"]
+    for idx, item in enumerate(new_items, 1):
+        fn  = item["images"]
+        fp  = os.path.join(folder_path, fn)
+        rec = {"filename": fn, "absolute_path": os.path.abspath(fp)}
+
+        try:
+            pil = Image.open(fp).convert("RGB")
+            arr = np.array(pil)
+        except Exception as e:
+            rec.update(status="Error", reason=str(e))
+            sm["file_read_errors"] += 1
+            report["results_list"].append(rec)
+            continue
+
+        preds = model.predict(source=arr, verbose=False)[0]
+        vb, hb = [], []
+        for box in preds.boxes:
+            if float(box.conf[0].item()) > 0.05:
+                xyxy = box.xyxy[0].tolist()
+                (vb if int(box.cls[0].item()) == 1 else hb).append(xyxy)
+
+        vc, hc = len(vb), len(hb)
+        if vc == 0 and hc == 0:
+            status = "None Detected";               sm["none_detected"] += 1
+        elif vc > 0 and hc == 0:
+            status = "Vertical Only";               sm["vertical_only"] += 1
+        elif vc == 0 and hc > 0:
+            status = "Horizontal Only";             sm["horizontal_only"] += 1
+        elif any(_bbox_crossed(b1, b2) for b1 in vb for b2 in hb):
+            status = "Both Detected (Crossed)";     sm["both_detected_crossed"] += 1
+        else:
+            status = "Both Detected (Not Crossed)"; sm["both_detected_not_crossed"] += 1
+
+        rec.update(status=status, detections={"vertical_count": vc, "horizontal_count": hc})
+        report["results_list"].append(rec)
+
+        if idx % 100 == 0 or idx == len(new_items):
+            print(f"  [YOLO] 進度: {idx}/{len(new_items)}")
+
+    sm["total_images"] = len(report["results_list"])
+    with open(results_path, 'w', encoding='utf-8') as f:
+        json.dump(report, f, ensure_ascii=False, indent=4)
+    print(f"  [YOLO] 完成！結果儲存至: {results_path}")
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 2a-alt  A+C 尺規辨識（無需訓練模型）
+#   C: HSV 黃色遮罩 → 垂直黃色直尺
+#   A: Hough 直線 + 長度篩選 → 水平灰色橫條
+# ─────────────────────────────────────────────────────────────
+
+def _detect_rulers_ac(img_path):
+    """
+    偵測單張圖片中的垂直黃色直尺（C法）與水平橫條（A法）。
+    回傳 (has_vertical, has_horizontal, is_crossed, v_boxes, h_lines)
+    """
     import cv2
-    
+
     img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         return False, False, False, [], []
-    
+
     h_img, w_img = img.shape[:2]
-    
-    # ── YOLO 找垂直尺位置 ──────────────────────
-    pil = Image.open(img_path).convert("RGB")
-    arr = np.array(pil)
-    preds = yolo_model.predict(source=arr, verbose=False)[0]
-    
+
+    # ── C: HSV 黃色遮罩 → 垂直尺 ─────────────────────
+    hsv  = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv,
+                       np.array(YELLOW_HSV_LOWER, dtype=np.uint8),
+                       np.array(YELLOW_HSV_UPPER, dtype=np.uint8))
+    # 閉運算填補黑色刻度造成的斷點
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
     v_boxes = []
-    for box in preds.boxes:
-        if float(box.conf[0].item()) > 0.05:
-            xyxy = box.xyxy[0].tolist()
-            if int(box.cls[0].item()) == 1:  # 垂直尺的 class
-                v_boxes.append(xyxy)
-    
-    # YOLO 找不到垂直尺 → fallback 到 HSV 黃色偵測
-    if not v_boxes:
-        _, _, _, v_boxes, _ = _detect_rulers_ac(img_path)
-    
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in contours:
+        if cv2.contourArea(c) < 400:
+            continue
+        # x, y, cw, ch = cv2.boundingRect(c)
+        # if ch / max(cw, 1) > 2.5 and ch > h_img * 0.12:  # 長寬比 > 2.5 且夠長
+        #     v_boxes.append((x, y, x + cw, y + ch))
+        # ── 取代原本 boundingRect 的寫法 ──
+        rect = cv2.minAreaRect(c)  # 得到 ((cx, cy), (w, h), angle)
+        (cw, ch) = rect[1]
+        # 確保 ch 永遠是長邊，cw 是短邊
+        if cw > ch:
+            cw, ch = ch, cw
+
+        if ch / max(cw, 1) > 2.5 and ch > h_img * 0.12:
+            # 為了維持原程式格式，這裡計算其包覆範圍，但長寬比已經用旋轉矩形驗證過了
+            x, y, w, h = cv2.boundingRect(c)
+            v_boxes.append((x, y, x + w, y + h))
+
     has_vertical = len(v_boxes) > 0
-    
-    # ── 在垂直尺「左右擴展區域」用 Hough 找水平依靠物 ──
+
+    # ── A: Hough 直線 → 水平橫條 ─────────────────────
     gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray  = clahe.apply(gray)
-    edges = cv2.Canny(gray, 30, 100, apertureSize=3)
-    
-    min_len = int(w_img * 0.15)  # 降低門檻
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+
+    min_len = int(w_img * HOUGH_MIN_LINE_RATIO)
     lines   = cv2.HoughLinesP(edges, 1, np.pi / 180,
-                               threshold=50, minLineLength=min_len, maxLineGap=30)
+                               threshold=60, minLineLength=min_len, maxLineGap=25)
     h_lines = []
     if lines is not None:
         for x1, y1, x2, y2 in lines[:, 0]:
             angle = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
-            if angle < 30 or angle > 150:
+            if angle < 20 or angle > 160:   # ±20° 視為水平
                 h_lines.append((x1, y1, x2, y2))
-    
-    # ── 判斷水平線是否在尺的高度範圍內（依靠偵測）──
-    has_horizontal = False
-    is_crossed     = False
-    
-    for vx1, vy1, vx2, vy2 in v_boxes:
+
+    has_horizontal = len(h_lines) > 0
+
+    # ── 交叉判斷 ─────────────────────────────────────
+    is_crossed = False
+    if has_vertical and has_horizontal:
         for hx1, hy1, hx2, hy2 in h_lines:
-            line_y = (hy1 + hy2) / 2
-            # 水平線的 y 落在尺的高度範圍內
-            if vy1 <= line_y <= vy2:
-                has_horizontal = True
+            hcy   = (hy1 + hy2) / 2
+            hx_lo = min(hx1, hx2)
+            hx_hi = max(hx1, hx2)
+            for vx1, vy1, vx2, vy2 in v_boxes:
                 vcx = (vx1 + vx2) / 2
-                hx_lo = min(hx1, hx2) - 50   # 加容差
-                hx_hi = max(hx1, hx2) + 50
-                if hx_lo <= vcx <= hx_hi:
+                if (vy1 <= hcy <= vy2) and (hx_lo <= vcx <= hx_hi):
                     is_crossed = True
                     break
-        if is_crossed:
-            break
-    
+            if is_crossed:
+                break
+
     return has_vertical, has_horizontal, is_crossed, v_boxes, h_lines
+
+
+def run_ruler_ac(output_json_path, folder_path):
+    """
+    增量 A+C 尺規辨識。
+    只處理 output.json 中尚未有結果的照片。
+    結果附加至 <output_dir>/ruler_ac_results.json。
+    """
+    out_dir      = os.path.dirname(output_json_path)
+    results_path = os.path.join(out_dir, "ruler_ac_results.json")
+
+    if os.path.exists(results_path):
+        with open(results_path, 'r', encoding='utf-8') as f:
+            report = json.load(f)
+    else:
+        report = {
+            "summary": {k: 0 for k in [
+                "total_images", "both_detected_crossed", "both_detected_not_crossed",
+                "vertical_only", "horizontal_only", "none_detected", "file_read_errors"
+            ]},
+            "results_list": []
+        }
+
+    done = {r["filename"] for r in report["results_list"]}
+
+    with open(output_json_path, 'r', encoding='utf-8') as f:
+        new_items = [it for it in json.load(f) if it.get("images") and it["images"] not in done]
+
+    if not new_items:
+        print("  [尺規A+C] 無新照片需處理。")
+        return
+
+    print(f"  [尺規A+C] 開始辨識 {len(new_items)} 張新照片...")
+
+    sm = report["summary"]
+    for idx, item in enumerate(new_items, 1):
+        fn  = item["images"]
+        fp  = os.path.join(folder_path, fn)
+        rec = {"filename": fn, "absolute_path": os.path.abspath(fp)}
+
+        try:
+            has_v, has_h, crossed, _, _ = _detect_rulers_ac(fp)
+        except Exception as e:
+            rec.update(status="Error", reason=str(e))
+            sm["file_read_errors"] += 1
+            report["results_list"].append(rec)
+            continue
+
+        if not has_v and not has_h:
+            status = "None Detected";               sm["none_detected"] += 1
+        elif has_v and not has_h:
+            status = "Vertical Only";               sm["vertical_only"] += 1
+        elif not has_v and has_h:
+            status = "Horizontal Only";             sm["horizontal_only"] += 1
+        elif crossed:
+            status = "Both Detected (Crossed)";     sm["both_detected_crossed"] += 1
+        else:
+            status = "Both Detected (Not Crossed)"; sm["both_detected_not_crossed"] += 1
+
+        rec.update(status=status, detections={"has_vertical": has_v, "has_horizontal": has_h})
+        report["results_list"].append(rec)
+
+        if idx % 100 == 0 or idx == len(new_items):
+            print(f"  [尺規A+C] 進度: {idx}/{len(new_items)}")
+
+    sm["total_images"] = len(report["results_list"])
+    with open(results_path, 'w', encoding='utf-8') as f:
+        json.dump(report, f, ensure_ascii=False, indent=4)
+    print(f"  [尺規A+C] 完成！結果儲存至: {results_path}")
