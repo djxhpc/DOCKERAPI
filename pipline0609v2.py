@@ -1,5 +1,3 @@
-你覺得我的尺規那邊程式有何問題 輸出之後顯示"status": "None Detected"發現水平還是會有放東西(桿子、木棍之類)去依靠站著的尺
-有啥方法能確定水平方向沒有東西去依靠我站著的尺(黃白色尺)
 """
 pipeline_0525.py — 影像去重與多模態辨識整合管道
 
@@ -21,7 +19,7 @@ import unicodedata
 import numpy as np
 from PIL import Image, ImageOps
 import imagehash
-
+import cv2
 
 
 # =============================================
@@ -64,7 +62,7 @@ BENCHMARK_YOLO_PADDING    = 0.3    # 裁切框四周額外留邊比例（相對�
 YELLOW_HSV_LOWER = [18, 100, 100]
 YELLOW_HSV_UPPER = [38, 255, 255]
 # 水平橫條最小長度（佔圖寬比例），過短的線段視為背景雜訊
-HOUGH_MIN_LINE_RATIO = 0.35
+HOUGH_MIN_LINE_RATIO = 0.15
 
 # ── 步驟路由 ──────────────────────────────────
 # 資料夾名稱（或路徑）包含 key 時，執行 value 中的步驟。
@@ -473,70 +471,184 @@ def run_yolo(output_json_path, folder_path, model_path):
 #   A: Hough 直線 + 長度篩選 → 水平灰色橫條
 # ─────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────
+# STEP 2a-alt  A+C 尺規辨識（無需訓練模型）
+#   C: HSV 黃色遮罩 → 垂直/水平黃色直尺（方向不限）
+#   A: Hough 直線群組分析 → 確認為尺規（非單根棍子）
+# ─────────────────────────────────────────────────────────────
+
+def _group_parallel_lines(lines, axis='h', gap=20):
+    """
+    將接近同位置的平行線群組化。
+    axis='h': 依 y 座標分群（水平線）
+    axis='v': 依 x 座標分群（垂直線）
+    回傳 list of groups，每個 group 是 list of lines。
+    """
+    if not lines:
+        return []
+
+    key_fn = (lambda l: (l[1] + l[3]) / 2) if axis == 'h' else (lambda l: (l[0] + l[2]) / 2)
+    sorted_lines = sorted(lines, key=key_fn)
+
+    groups = []
+    current = [sorted_lines[0]]
+    for line in sorted_lines[1:]:
+        if abs(key_fn(line) - key_fn(current[-1])) <= gap:
+            current.append(line)
+        else:
+            groups.append(current)
+            current = [line]
+    groups.append(current)
+    return groups
+
+
+def _ruler_band_has_yellow(img_hsv, y_lo, y_hi, x_lo, x_hi,
+                            yellow_lower, yellow_upper, ratio=0.03):
+    """
+    檢查指定矩形區域內是否有足夠比例的黃色像素。
+    """
+    roi = img_hsv[max(0, y_lo):y_hi, max(0, x_lo):x_hi]
+    if roi.size == 0:
+        return False
+    mask = cv2.inRange(roi,
+                       np.array(yellow_lower, dtype=np.uint8),
+                       np.array(yellow_upper, dtype=np.uint8))
+    return (mask > 0).mean() >= ratio
+
+
 def _detect_rulers_ac(img_path):
     """
-    偵測單張圖片中的垂直黃色直尺（C法）與水平橫條（A法）。
-    回傳 (has_vertical, has_horizontal, is_crossed, v_boxes, h_lines)
+    偵測單張圖片中的直尺（C法：黃色HSV）與水平尺規（A法：Hough線群）。
+    
+    改進重點：
+    1. C法同時支援垂直與水平方向的黃色尺規（圖片方向不固定）
+    2. A法要求水平線必須是「多條平行線的群組」或「帶有黃色紋理」，
+       排除單根棍子/桿子
+    
+    回傳 (has_vertical, has_horizontal, is_crossed, v_boxes, h_ruler_bands)
     """
-    import cv2
+    
 
     img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         return False, False, False, [], []
 
     h_img, w_img = img.shape[:2]
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-    # ── C: HSV 黃色遮罩 → 垂直尺 ─────────────────────
-    hsv  = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    # ══════════════════════════════════════════════════════
+    # C法：HSV 黃色遮罩 → 偵測黃色尺規（垂直或水平皆可）
+    # ══════════════════════════════════════════════════════
     mask = cv2.inRange(hsv,
                        np.array(YELLOW_HSV_LOWER, dtype=np.uint8),
                        np.array(YELLOW_HSV_UPPER, dtype=np.uint8))
-    # 閉運算填補黑色刻度造成的斷點
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
     mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-    v_boxes = []
+    v_boxes   = []  # 垂直方向黃色尺規
+    h_y_boxes = []  # 水平方向黃色尺規（來自C法）
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for c in contours:
         if cv2.contourArea(c) < 400:
             continue
-        # x, y, cw, ch = cv2.boundingRect(c)
-        # if ch / max(cw, 1) > 2.5 and ch > h_img * 0.12:  # 長寬比 > 2.5 且夠長
-        #     v_boxes.append((x, y, x + cw, y + ch))
-        # ── 取代原本 boundingRect 的寫法 ──
-        rect = cv2.minAreaRect(c)  # 得到 ((cx, cy), (w, h), angle)
-        (cw, ch) = rect[1]
-        # 確保 ch 永遠是長邊，cw 是短邊
-        if cw > ch:
-            cw, ch = ch, cw
+        rect  = cv2.minAreaRect(c)
+        (rw, rh) = rect[1]
+        # 確保 rh 永遠是長邊
+        if rw > rh:
+            rw, rh = rh, rw
+        aspect = rh / max(rw, 1)
 
-        if ch / max(cw, 1) > 2.5 and ch > h_img * 0.12:
-            # 為了維持原程式格式，這裡計算其包覆範圍，但長寬比已經用旋轉矩形驗證過了
-            x, y, w, h = cv2.boundingRect(c)
-            v_boxes.append((x, y, x + w, y + h))
+        x, y, bw, bh = cv2.boundingRect(c)
 
-    has_vertical = len(v_boxes) > 0
+        if aspect > 2.5 and rh > h_img * 0.12:
+            # 長邊顯著 → 判斷朝向
+            angle = rect[2]  # OpenCV minAreaRect 角度 (-90, 0]
+            # 判斷是否接近垂直（角度在 -90°~-70° 或 -20°~0° 之間視為垂直）
+            # minAreaRect 回傳的角度定義：短邊與水平軸夾角
+            # 若矩形接近垂直，angle 會接近 -90° 或接近 0° 但長邊為垂直
+            if bh >= bw:  # bounding box 高度 >= 寬度 → 視為垂直尺
+                v_boxes.append((x, y, x + bw, y + bh))
+            else:         # bounding box 寬度 > 高度 → 視為水平尺
+                h_y_boxes.append((x, y, x + bw, y + bh))
 
-    # ── A: Hough 直線 → 水平橫條 ─────────────────────
+    has_vertical   = len(v_boxes) > 0
+    # 黃色水平尺（C法直接確認）
+    has_h_yellow   = len(h_y_boxes) > 0
+
+    # ══════════════════════════════════════════════════════
+    # A法：Hough 直線 → 嚴格篩選水平尺規（排除棍子）
+    # ══════════════════════════════════════════════════════
     gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150, apertureSize=3)
 
     min_len = int(w_img * HOUGH_MIN_LINE_RATIO)
     lines   = cv2.HoughLinesP(edges, 1, np.pi / 180,
-                               threshold=60, minLineLength=min_len, maxLineGap=25)
-    h_lines = []
+                               threshold=60,
+                               minLineLength=min_len,
+                               maxLineGap=25)
+
+    raw_h_lines = []
     if lines is not None:
         for x1, y1, x2, y2 in lines[:, 0]:
             angle = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
-            if angle < 35 or angle > 145:   # ±20° 視為水平
-                h_lines.append((x1, y1, x2, y2))
+            if angle < 20 or angle > 160:   # ±20° 視為水平
+                raw_h_lines.append((x1, y1, x2, y2))
 
-    has_horizontal = len(h_lines) > 0
+    # ── 關鍵過濾：排除孤立單線（棍子特徵）──────────────────
+    #
+    # 策略一：群組化 — 要求同一 Y 帶內至少有 N 條平行線
+    #         （尺規有刻度，會產生多條平行邊緣線）
+    # 策略二：黃色紋理驗證 — 線條附近有黃色像素
+    # 兩者任一成立即視為有效水平尺規
+    # ─────────────────────────────────────────────────────
 
-    # ── 交叉判斷 ─────────────────────────────────────
+    MIN_PARALLEL_LINES = 2   # 至少 2 條平行線才視為尺規
+    BAND_HALF          = 15  # 線條上下各 15px 的帶狀區域做黃色驗證
+
+    valid_h_ruler_bands = []
+
+    groups = _group_parallel_lines(raw_h_lines, axis='h', gap=20)
+    for group in groups:
+        if len(group) >= MIN_PARALLEL_LINES:
+            # 群組內線條足夠多 → 確定是尺規
+            valid_h_ruler_bands.append(group)
+            continue
+
+        # 單條線 → 進行黃色紋理驗證
+        x1, y1, x2, y2 = group[0]
+        y_center = int((y1 + y2) / 2)
+        x_lo     = min(x1, x2)
+        x_hi     = max(x1, x2)
+        if _ruler_band_has_yellow(hsv,
+                                   y_center - BAND_HALF,
+                                   y_center + BAND_HALF,
+                                   x_lo, x_hi,
+                                   YELLOW_HSV_LOWER, YELLOW_HSV_UPPER,
+                                   ratio=0.03):
+            valid_h_ruler_bands.append(group)
+        # 否則視為棍子/桿子，丟棄
+
+    has_h_hough = len(valid_h_ruler_bands) > 0
+
+    # 水平尺：C法黃色 OR A法嚴格Hough
+    has_horizontal = has_h_yellow or has_h_hough
+
+    # 合併所有水平線段（供交叉判斷）
+    all_h_lines = []
+    for g in valid_h_ruler_bands:
+        all_h_lines.extend(g)
+    for bx1, by1, bx2, by2 in h_y_boxes:
+        # 將水平黃色 bbox 轉成中心線
+        mid_y = (by1 + by2) // 2
+        all_h_lines.append((bx1, mid_y, bx2, mid_y))
+
+    # ══════════════════════════════════════════════════════
+    # 交叉判斷（直立尺 ∩ 水平尺）
+    # ══════════════════════════════════════════════════════
     is_crossed = False
     if has_vertical and has_horizontal:
-        for hx1, hy1, hx2, hy2 in h_lines:
+        for hx1, hy1, hx2, hy2 in all_h_lines:
             hcy   = (hy1 + hy2) / 2
             hx_lo = min(hx1, hx2)
             hx_hi = max(hx1, hx2)
@@ -548,7 +660,7 @@ def _detect_rulers_ac(img_path):
             if is_crossed:
                 break
 
-    return has_vertical, has_horizontal, is_crossed, v_boxes, h_lines
+    return has_vertical, has_horizontal, is_crossed, v_boxes, all_h_lines
 
 
 def run_ruler_ac(output_json_path, folder_path):
