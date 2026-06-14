@@ -1,0 +1,97 @@
+🥇 優先建議（上公司後馬上做）
+1. 逐行即時寫入 JSON —— 監控模式下同事可看即時進度
+目前程式是「全部掃完才寫一次」。改成「每張圖分析完就即刻附加」，同事就能開著 auto_results.json 看進度，不用等全部跑完才看結果。
+
+# 改成 append-write，加個檔鎖防止同時讀寫衝突
+def save_one_record(self, filename, record):
+    # 逐筆寫入，併發安全
+效果：同事體感會好很多（「欸，已經跑到 50 張了」）。
+
+2. 座標分類精化 —— 接入 pipeline0611 的 Class 1–8 邏輯
+我目前座標分支只用了通用 pattern，但你 pipeline0611 裡已經有針對 Class 1（本地NEH）、Class 7（E-N-Z 特殊順序）等的客製邏輯。可以改成：
+
+def analyze_coord_v2(path, engine, coord_yolo):
+    # 先用 coord_yolo 判斷是 Class 1/2/7/...
+    # 再用對應的 _CLASS_PATTERNS[class_id] 提取，會更精確
+效果：座標辨識正確率提升（你那套已經微調了幾個月的邏輯不用浪費）。
+
+3. 簡單設定面板 —— 讓同事不改程式碼也能調參數
+目前檔頭的 ENABLE_UNKNOWN_FALLBACK, WATCH_INTERVAL 等需要改 .py。改成讀一個 .json 設定檔：
+
+// auto_config.json
+{
+  "watch_interval": 5,
+  "enable_fallback": true,
+  "classify_conf_thresh": 0.6,
+  "max_retries": 3
+}
+效果：同事想改掃描間隔從 5s 改成 10s，改個 JSON 就行，零技術門檻。
+
+🥈 次優建議（公司用順手後可做）
+4. 統計報告 —— 每批次生成 summary.json
+批次完成後輸出：
+
+{
+  "total": 50,
+  "success": 45,
+  "needs_review": 3,
+  "duplicates": 2,
+  "unknown": 0,
+  "processing_time_sec": 120,
+  "issues": [
+    {"file": "img001.jpg", "reason": "座標格式異常，請重新拍攝"}
+  ]
+}
+效果：同事一眼掃過，知道有沒有異常，而不用逐筆翻 JSON。
+
+5. 失敗重試 + Timeout —— 某些 YOLO/OCR 可能卡住
+目前沒防護，萬一 OCR 卡死會拖累整個批次。加上：
+
+def _safe_run_with_timeout(typ, path, models, timeout=30):
+    try:
+        return timeout_wrapper(lambda: run_branch(typ, path, models), timeout)
+    except TimeoutError:
+        return {"error": "timeout", "retry": True}
+效果：卡死的圖不會卡死整個程式，可以標記重試。
+
+6. 資料夾遞迴進件 —— 同事丟整個資料夾也能掃
+目前只掃單層。改成：
+
+# 掃 input_dir 及其子資料夾
+for root, dirs, files in os.walk(input_dir):
+    for fn in files if fn.lower().endswith(_IMG_EXT):
+        process_image(os.path.join(root, fn), ...)
+效果：同事複製整個案件資料夾進來，一口氣分析完。
+
+🥉 可選建議（用很久才會想要）
+7. 信心度細節 —— 每筆輸出加「決策過程」
+"decision_log": {
+  "classify_model": { "class": "埋深", "conf": 0.97, "status": "✓ 採用" },
+  "fallback_attempts": {
+    "coord": { "status": "✗", "reason": "無有效值" },
+    "benchmark": { "status": "✗", "reason": "無4位數字" },
+    "ruler": { "status": "✓", "value": "Normal (Crossed)" }
+  }
+}
+同事後續想「為什麼你判它是尺規而不是座標」，可以直接看。
+
+8. Web 儀表板（可有可無）
+用 Flask/FastAPI 跑個本地網頁，即時顯示：
+
+當前掃描進度 (進度條)
+已處理的圖片縮圖 + 分類標籤
+即時 log（什麼時候偵測到新檔，什麼時候完成）
+但這工作量大，得評估同事有沒有真的需要。
+
+📋 實操路線圖
+第一輪（這周公司測）：
+
+✅ 驗證模型和程式能跑
+✅ 確認三種判斷邏輯輸出是否合期望
+第二輪（模型確認後）：
+
+做 #1 即時寫入 + #2 座標精化（這兩個改進最大）
+做 #3 設定檔（提升易用性）
+第三輪（穩定運行後）：
+
+加 #4 統計報告 + #5 重試機制
