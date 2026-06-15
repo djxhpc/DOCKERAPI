@@ -1,4 +1,3 @@
-請幫我加上調用GPU 沒用就調回CPU 開頭要print出來顯示有無成功調用
 
 # -*- coding: utf-8 -*-
 """
@@ -16,6 +15,17 @@ CLASS_TO_TYPE = {
     "座標":   "coord",
 }
 （影像分類模型已無 "其他" 類別）
+
+== GPU / CPU 自動偵測 ==
+
+    模組載入時會自動偵測 CUDA 是否可用：
+      - 可用 -> DEVICE = "cuda"，所有 YOLO 模型推論使用 GPU
+      - 不可用或偵測失敗 -> 自動回退 DEVICE = "cpu"
+    並會在 import 時印出偵測結果，例如：
+      [GPU 偵測] CUDA 可用 -> 使用 GPU (cuda)
+      [GPU 偵測] CUDA 不可用 -> 回退使用 CPU
+
+    RapidOCR (onnxruntime) 會嘗試使用 CUDAExecutionProvider，失敗則自動回退 CPU。
 
 == 作為函式庫使用 ==
 
@@ -54,6 +64,45 @@ import numpy as np
 import cv2
 import imagehash
 from PIL import Image, ImageOps
+
+
+# =============================================
+# GPU / CPU 自動偵測
+# =============================================
+# DEVICE 用於 YOLO 模型推論（"cuda" 或 "cpu"）。
+# ORT_PROVIDERS 用於 RapidOCR (onnxruntime) 推論。
+DEVICE = "cpu"
+ORT_PROVIDERS = ["CPUExecutionProvider"]
+
+try:
+    import torch
+    if torch.cuda.is_available():
+        DEVICE = "cuda"
+        gpu_name = torch.cuda.get_device_name(0)
+        print(f"[GPU 偵測] CUDA 可用 -> 使用 GPU ({DEVICE}: {gpu_name})")
+    else:
+        DEVICE = "cpu"
+        print("[GPU 偵測] CUDA 不可用 -> 回退使用 CPU")
+except Exception as _e:
+    DEVICE = "cpu"
+    print(f"[GPU 偵測] 偵測失敗 ({_e}) -> 回退使用 CPU")
+
+# RapidOCR (onnxruntime) 的 execution provider：嘗試 CUDA，失敗則回退 CPU
+try:
+    import onnxruntime as _ort
+    _available_providers = _ort.get_available_providers()
+    if DEVICE == "cuda" and "CUDAExecutionProvider" in _available_providers:
+        ORT_PROVIDERS = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        print("[GPU 偵測] RapidOCR(onnxruntime) -> 使用 CUDAExecutionProvider")
+    else:
+        ORT_PROVIDERS = ["CPUExecutionProvider"]
+        if DEVICE == "cuda":
+            print("[GPU 偵測] RapidOCR(onnxruntime) 無 CUDAExecutionProvider -> 回退 CPU")
+        else:
+            print("[GPU 偵測] RapidOCR(onnxruntime) -> 使用 CPUExecutionProvider")
+except Exception as _e:
+    ORT_PROVIDERS = ["CPUExecutionProvider"]
+    print(f"[GPU 偵測] onnxruntime 偵測失敗 ({_e}) -> RapidOCR 回退 CPU")
 
 
 # =============================================
@@ -201,21 +250,31 @@ _MODEL_CACHE = {}
 
 
 def _get_model(key):
-    """延遲載入並快取 YOLO 模型。"""
+    """延遲載入並快取 YOLO 模型，依 DEVICE 載入到 GPU 或 CPU。"""
     if key not in _MODEL_CACHE:
         from ultralytics import YOLO as YOLOModel
         model_path = paths[key]
-        print(f"[模型載入] {key} -> {model_path}")
-        _MODEL_CACHE[key] = YOLOModel(model_path)
+        print(f"[模型載入] {key} -> {model_path} (device={DEVICE})")
+        model = YOLOModel(model_path)
+        try:
+            model.to(DEVICE)
+        except Exception as e:
+            print(f"  [警告] {key} 模型載入到 {DEVICE} 失敗 ({e})，改用 CPU")
+        _MODEL_CACHE[key] = model
     return _MODEL_CACHE[key]
 
 
 def _get_ocr_engine():
-    """延遲載入並快取 RapidOCR。"""
+    """延遲載入並快取 RapidOCR，依 ORT_PROVIDERS 嘗試使用 GPU。"""
     if "ocr" not in _MODEL_CACHE:
         from rapidocr_onnxruntime import RapidOCR
-        print("[模型載入] RapidOCR")
-        _MODEL_CACHE["ocr"] = RapidOCR()
+        print(f"[模型載入] RapidOCR (providers={ORT_PROVIDERS})")
+        try:
+            _MODEL_CACHE["ocr"] = RapidOCR(providers=ORT_PROVIDERS)
+        except TypeError:
+            # 舊版 rapidocr_onnxruntime 不支援 providers 參數，回退預設初始化
+            print("  [警告] 此版本 RapidOCR 不支援 providers 參數，使用預設設定")
+            _MODEL_CACHE["ocr"] = RapidOCR()
     return _MODEL_CACHE["ocr"]
 
 
@@ -230,7 +289,7 @@ def classify_image(filepath):
     class_name ∈ {"埋深", "水準點", "座標"}
     """
     model = _get_model("classify")
-    res = model(filepath, verbose=False)[0]
+    res = model(filepath, device=DEVICE, verbose=False)[0]
     conf = float(res.probs.top1conf)
     cls_name = res.names[res.probs.top1]
     return cls_name, round(conf, 4)
@@ -289,6 +348,7 @@ def run_ruler(filepath):
         conf=min(HORIZONTAL_CONF_THRESHOLD, VERTICAL_CONF_THRESHOLD),
         iou=0.5,
         augment=True,
+        device=DEVICE,
         verbose=False
     )[0]
 
@@ -324,7 +384,7 @@ def run_ruler(filepath):
 # =============================================
 
 def _yolo_crop_regions(img_array, model, conf_thresh, padding):
-    preds = model.predict(source=img_array, verbose=False)[0]
+    preds = model.predict(source=img_array, device=DEVICE, verbose=False)[0]
     h_img, w_img = img_array.shape[:2]
     crops = []
     for box in sorted(preds.boxes, key=lambda b: float(b.conf[0]), reverse=True):
@@ -646,7 +706,7 @@ def run_coord(filepath):
     # ── Step A: 格式分類 ──
     class_id = 9
     try:
-        pred = coord_yolo(filepath, verbose=False)[0]
+        pred = coord_yolo(filepath, device=DEVICE, verbose=False)[0]
         conf = float(pred.probs.top1conf)
         cls_name = pred.names[pred.probs.top1]
         if conf >= COORD_YOLO_CONF:
@@ -1035,7 +1095,7 @@ def _write_result_json(output_dir, filename, result):
 
 
 # =============================================
-# 批次處理 / 監控
+# 批次處理
 # =============================================
 
 def process_folder_once(folder, output_dir):
