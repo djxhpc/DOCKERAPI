@@ -1,0 +1,237 @@
+# -*- coding: utf-8 -*-
+"""
+viewer.py — 影像辨識結果可視化標註程式
+
+讀取 pipeline_watcher.py 產生的 <output_dir>/<檔名>.json 結果，
+搭配原圖（從 result["absolute_path"] 取得）一起顯示，
+讓使用者用按鈕或鍵盤快速標註：
+    O / 通過鍵 -> 在該筆結果 json 加上 "reviewed": "O"
+    X / 待修正鍵 -> 在該筆結果 json 加上 "reviewed": "X"，
+                    並將該筆完整結果寫入 <output_dir>/error_outputs.json
+
+使用方式:
+    python viewer.py --output <output_dir>
+"""
+
+import os
+import json
+import argparse
+import tkinter as tk
+from tkinter import ttk
+from PIL import Image, ImageOps, ImageTk
+
+
+def load_records(output_dir):
+    """讀取 output_dir 下所有 *.json（排除 hashes_db.json / error_outputs.json）。"""
+    records = []
+    for fn in sorted(os.listdir(output_dir)):
+        if not fn.lower().endswith(".json"):
+            continue
+        if fn in ("hashes_db.json", "error_outputs.json"):
+            continue
+        path = os.path.join(output_dir, fn)
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            records.append((path, data))
+        except Exception as e:
+            print(f"[警告] 無法讀取 {path}: {e}")
+    return records
+
+
+def save_record(path, data):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
+
+def append_error_output(output_dir, data):
+    err_path = os.path.join(output_dir, "error_outputs.json")
+    if os.path.exists(err_path):
+        with open(err_path, 'r', encoding='utf-8') as f:
+            err_list = json.load(f)
+    else:
+        err_list = []
+
+    # 以 filename 去重，後者覆蓋前者
+    err_list = [e for e in err_list if e.get("filename") != data.get("filename")]
+    err_list.append(data)
+
+    with open(err_path, 'w', encoding='utf-8') as f:
+        json.dump(err_list, f, ensure_ascii=False, indent=4)
+
+
+def remove_from_error_output(output_dir, filename):
+    err_path = os.path.join(output_dir, "error_outputs.json")
+    if not os.path.exists(err_path):
+        return
+    with open(err_path, 'r', encoding='utf-8') as f:
+        err_list = json.load(f)
+    err_list = [e for e in err_list if e.get("filename") != filename]
+    with open(err_path, 'w', encoding='utf-8') as f:
+        json.dump(err_list, f, ensure_ascii=False, indent=4)
+
+
+def format_summary(data):
+    """產生右側摘要文字。"""
+    lines = []
+    lines.append(f"檔名: {data.get('filename', 'N/A')}")
+    lines.append(f"分類: {data.get('class', 'N/A')}  (信心 {data.get('class_confidence', 'N/A')})")
+    lines.append(f"重複: {'是 -> ' + str(data.get('duplicate_of')) if data.get('is_duplicate') else '否'}")
+    lines.append(f"狀態: {data.get('needs_review', 'N/A')}")
+    lines.append("")
+
+    if "ruler_result" in data:
+        rr = data["ruler_result"]
+        lines.append("【尺規辨識】")
+        lines.append(f"  status: {rr.get('status')}")
+        det = rr.get("detections", {})
+        if det:
+            lines.append(f"  vertical 數: {det.get('vertical_count')}")
+            lines.append(f"  horizontal 數: {det.get('horizontal_count')}")
+            lines.append(f"  is_crossed: {det.get('is_crossed')}")
+            lines.append(f"  best_iou: {det.get('best_iou')}")
+
+    if "benchmark_result" in data:
+        br = data["benchmark_result"]
+        lines.append("【水準點辨識】")
+        lines.append(f"  number: {br.get('number')}")
+        lines.append(f"  ocr_conf: {br.get('ocr_conf')}")
+
+    if "coord_result" in data:
+        cr = data["coord_result"]
+        lines.append("【座標 OCR】")
+        lines.append(f"  N: {cr.get('N')}")
+        lines.append(f"  E: {cr.get('E')}")
+        lines.append(f"  H/Z: {cr.get('H_Z')}")
+        lines.append(f"  格式類別: {cr.get('coord_class')}")
+
+    if data.get("error"):
+        lines.append("")
+        lines.append(f"[錯誤] {data['error']}")
+
+    if data.get("reviewed"):
+        lines.append("")
+        lines.append(f">>> 已標註: {data['reviewed']}")
+
+    return "\n".join(lines)
+
+
+class ViewerApp:
+    def __init__(self, root, output_dir):
+        self.root = root
+        self.output_dir = output_dir
+        self.records = load_records(output_dir)
+        self.index = 0
+
+        self.root.title("影像辨識結果檢視 / 標註")
+        self.root.geometry("1100x700")
+
+        # ── 左側：圖片預覽 ──
+        self.image_label = tk.Label(root, bg="#222222")
+        self.image_label.place(x=10, y=10, width=700, height=600)
+        self._tk_img = None
+
+        # ── 右側：摘要文字 ──
+        self.summary_text = tk.Text(root, wrap="word", font=("Microsoft JhengHei", 11))
+        self.summary_text.place(x=720, y=10, width=370, height=600)
+
+        # ── 底部：控制按鈕 ──
+        self.status_label = tk.Label(root, text="", font=("Microsoft JhengHei", 11))
+        self.status_label.place(x=10, y=620, width=400, height=30)
+
+        btn_prev = ttk.Button(root, text="← 上一張", command=self.prev_record)
+        btn_prev.place(x=420, y=620, width=90, height=40)
+
+        btn_next = ttk.Button(root, text="下一張 →", command=self.next_record)
+        btn_next.place(x=520, y=620, width=90, height=40)
+
+        btn_pass = ttk.Button(root, text="O 通過 (鍵盤 O)", command=lambda: self.mark("O"))
+        btn_pass.place(x=720, y=620, width=160, height=40)
+
+        btn_fail = ttk.Button(root, text="X 待修正 (鍵盤 X)", command=lambda: self.mark("X"))
+        btn_fail.place(x=890, y=620, width=160, height=40)
+
+        # ── 鍵盤綁定 ──
+        root.bind("<Key-o>", lambda e: self.mark("O"))
+        root.bind("<Key-O>", lambda e: self.mark("O"))
+        root.bind("<Key-x>", lambda e: self.mark("X"))
+        root.bind("<Key-X>", lambda e: self.mark("X"))
+        root.bind("<Left>", lambda e: self.prev_record())
+        root.bind("<Right>", lambda e: self.next_record())
+
+        self.show_record()
+
+    def show_record(self):
+        if not self.records:
+            self.summary_text.delete("1.0", tk.END)
+            self.summary_text.insert("1.0", "找不到任何結果 JSON。")
+            self.status_label.config(text="0 / 0")
+            return
+
+        path, data = self.records[self.index]
+
+        # 圖片
+        img_path = data.get("absolute_path")
+        if img_path and os.path.exists(img_path):
+            try:
+                img = Image.open(img_path)
+                img = ImageOps.exif_transpose(img).convert("RGB")
+                img.thumbnail((680, 580))
+                self._tk_img = ImageTk.PhotoImage(img)
+                self.image_label.config(image=self._tk_img, text="")
+            except Exception as e:
+                self.image_label.config(image="", text=f"無法載入圖片:\n{e}")
+        else:
+            self.image_label.config(image="", text=f"找不到圖片:\n{img_path}")
+
+        # 摘要
+        self.summary_text.delete("1.0", tk.END)
+        self.summary_text.insert("1.0", format_summary(data))
+
+        self.status_label.config(
+            text=f"{self.index + 1} / {len(self.records)}   檔案: {os.path.basename(path)}"
+        )
+
+    def mark(self, value):
+        if not self.records:
+            return
+        path, data = self.records[self.index]
+        data["reviewed"] = value
+        save_record(path, data)
+
+        if value == "X":
+            append_error_output(self.output_dir, data)
+        else:
+            remove_from_error_output(self.output_dir, data.get("filename"))
+
+        self.records[self.index] = (path, data)
+        self.show_record()
+        self.next_record()
+
+    def next_record(self):
+        if not self.records:
+            return
+        if self.index < len(self.records) - 1:
+            self.index += 1
+            self.show_record()
+
+    def prev_record(self):
+        if not self.records:
+            return
+        if self.index > 0:
+            self.index -= 1
+            self.show_record()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="影像辨識結果可視化標註程式")
+    parser.add_argument("--output", required=True, help="pipeline_watcher.py 的輸出資料夾")
+    args = parser.parse_args()
+
+    root = tk.Tk()
+    app = ViewerApp(root, args.output)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
