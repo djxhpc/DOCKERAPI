@@ -1,0 +1,141 @@
+# -*- coding: utf-8 -*-
+"""
+api.py — vision_pipeline 的 FastAPI 包裝
+
+提供 HTTP REST 介面，讓外部系統（例如另一台機器、Web 前端、排程系統）
+可以呼叫四模型整合影像辨識管道，不需直接在該主機上跑 Python。
+
+啟動方式:
+    uvicorn api:app --host 0.0.0.0 --port 8000
+
+API 端點:
+    GET  /health
+        健康檢查，回傳 {"status": "ok"}
+
+    POST /process
+        處理伺服器本機檔案系統上「已存在」的單張影像或資料夾。
+        Request JSON:
+            {
+                "path": "/abs/path/to/image_or_folder",
+                "output_dir": "/abs/path/to/output",
+                "phash": false,            // 選填，預設 false
+                "phash_threshold": 8       // 選填，預設 8
+            }
+        回傳:
+            - path 為檔案: 該張影像的辨識結果 dict
+            - path 為資料夾: {"processed": <新處理張數>, "output_dir": ...}
+
+    POST /process_upload
+        上傳影像檔案（multipart/form-data），伺服器儲存後立即處理。
+        Form fields:
+            file            : 影像檔案 (必填)
+            output_dir      : 結果輸出資料夾 (必填)
+            phash           : "true"/"false" (選填，預設 false)
+            phash_threshold : 整數 (選填)
+        回傳: 該張影像的辨識結果 dict
+
+    GET  /result/{output_dir_b64}/{filename}
+        讀取既有結果 json。output_dir_b64 為 output_dir 的 URL-safe base64 編碼字串。
+"""
+
+import os
+import base64
+import shutil
+import tempfile
+
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.responses import JSONResponse
+
+import vision_pipeline as vp
+
+app = FastAPI(title="Vision Pipeline API", version="1.0")
+
+
+def _apply_phash_settings(phash: bool, phash_threshold: int | None):
+    vp.PHASH_SUSPECTED_ENABLED = bool(phash)
+    if phash_threshold is not None:
+        vp.PHASH_SUSPECTED_THRESHOLD = int(phash_threshold)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/process")
+def process(payload: dict):
+    """
+    處理伺服器本機檔案系統上的影像或資料夾。
+    """
+    path = payload.get("path")
+    output_dir = payload.get("output_dir")
+    phash = payload.get("phash", False)
+    phash_threshold = payload.get("phash_threshold")
+
+    if not path or not output_dir:
+        raise HTTPException(status_code=400, detail="需要提供 path 與 output_dir")
+
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"找不到路徑: {path}")
+
+    _apply_phash_settings(phash, phash_threshold)
+
+    if os.path.isdir(path):
+        new_count = vp.process_folder_once(path, output_dir)
+        return {"processed": new_count, "output_dir": output_dir}
+    else:
+        result = vp.process_single_image(path, output_dir)
+        return JSONResponse(content=result)
+
+
+@app.post("/process_upload")
+async def process_upload(
+    file: UploadFile = File(...),
+    output_dir: str = Form(...),
+    phash: bool = Form(False),
+    phash_threshold: int | None = Form(None),
+):
+    """
+    上傳單張影像並立即處理。檔案會先存到暫存目錄再執行辨識管道。
+    """
+    _apply_phash_settings(phash, phash_threshold)
+
+    suffix = os.path.splitext(file.filename or "")[1] or ".jpg"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
+
+    try:
+        # 保留原始檔名（process_single_image 會用 basename 當輸出 json 檔名）
+        target_dir = os.path.dirname(tmp_path)
+        target_path = os.path.join(target_dir, file.filename or os.path.basename(tmp_path))
+        if target_path != tmp_path:
+            os.rename(tmp_path, target_path)
+            tmp_path = target_path
+
+        result = vp.process_single_image(tmp_path, output_dir)
+        return JSONResponse(content=result)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+@app.get("/result/{output_dir_b64}/{filename}")
+def get_result(output_dir_b64: str, filename: str):
+    """
+    讀取既有結果 json。output_dir_b64 為 output_dir 的 URL-safe base64 編碼。
+    例如 output_dir = "/data/out" -> base64.urlsafe_b64encode(b"/data/out").decode()
+    """
+    try:
+        output_dir = base64.urlsafe_b64decode(output_dir_b64.encode()).decode()
+    except Exception:
+        raise HTTPException(status_code=400, detail="output_dir_b64 解碼失敗")
+
+    json_path = os.path.join(output_dir, f"{filename}.json")
+    if not os.path.exists(json_path):
+        raise HTTPException(status_code=404, detail=f"找不到結果: {json_path}")
+
+    import json as _json
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = _json.load(f)
+    return JSONResponse(content=data)
