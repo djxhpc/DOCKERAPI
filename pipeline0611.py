@@ -1,3 +1,14 @@
+依此程式原先邏輯，建立新的獨立程式，裡面的四個模型都會使用到，(paths = {
+    "classify": r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\117\影像分類best.pt",
+    "ruler":    r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\117\尺規bestv3.pt",
+    "coordfmt": r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\117\判斷格式分類best2.pt",
+    "bench":    r"C:\Users\WF_114.WFUSION\Desktop\pin\Chiayi\117\一等水準點best.pt",
+})(影像分類best模型沒有"其他"分類了 只剩CLASS_TO_TYPE = {
+    "埋深":   "ruler",
+    "水準點": "benchmark",
+    "座標":   "coord",
+})主要是應用當單個新影像或批次新影像進入資料夾時程式能主動進行處理並回傳輸出(json)到指定位置，然後新照片進來會儲存在另一個json資料庫(主要拿來核對是否是影像重複內容 用原本SHA26跟hash)，並新增另一個程式，主要是可視化內容，包含能看到影像分類分到哪類以及輸出與影像預覽，還有可按O表示通過跟X待修正，留錯誤輸出影像的json檔
+
 """
 pipeline_0525.py — 影像去重與多模態辨識整合管道
 
